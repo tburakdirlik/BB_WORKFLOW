@@ -2,73 +2,21 @@
 
 A single-file **subdomain enumeration & attack-surface mapping** pipeline for bug bounty and authorized penetration testing.
 
-Point it at a domain (or a list of domains) and it produces the most complete, accurate set of **live subdomains** it can — plus the dead ones (so you can reuse them for virtual-host enumeration), the live web services, subdomain-takeover candidates, and optionally open ports — all combined into one human-readable report with machine-readable companion files.
+Point it at a domain (or a list) and it produces the most complete, accurate set of **live subdomains** it can — plus the dead ones (reuse them for virtual-host enumeration), the live web services, subdomain-takeover candidates, and optionally open ports — in one human-readable report with machine-readable companions.
 
-> ⚠️ Only test assets you are explicitly authorized to assess (in-scope bug bounty programs, your own infrastructure, or systems you have written permission to test).
-
----
-
-## What it does
-
-Given a target domain, `recon.py` runs an end-to-end pipeline:
-
-1. **Root domain discovery** — finds related root domains via WHOIS.
-2. **Passive enumeration** — pulls subdomains from many public sources at once.
-3. **DNS resolution** — resolves candidates and *re-validates* with trusted resolvers to kill false positives.
-4. **Active discovery** — expands the set with brute-force, permutations, and optional recursion.
-5. **HTTP probing** — finds what is actually live over HTTP and fingerprints it.
-6. **Subdomain takeover detection** — flags hosts pointing at unclaimed third-party services.
-7. **Virtual-host enumeration** *(optional)* — fuzzes dead names as `Host` headers against live IPs.
-8. **Port scan** *(optional)* — nmap on the live IPs.
-9. **Monitoring mode** *(optional)* — diffs against the previous run and surfaces only what is **new**.
-
-Every stage **degrades gracefully**: if an external tool isn't installed, that phase is skipped or falls back to a built-in implementation rather than crashing. With *zero* external tools, the native crt.sh source + threaded resolver still produce useful output.
+> ⚠️ Only test assets you are explicitly authorized to assess.
 
 ---
 
-## Requirements
-
-- **Python 3.7+** — standard library only, no `pip install` needed.
-- External tools are **optional**; each one unlocks or improves a phase.
-
-### Install (macOS)
+## Install
 
 ```bash
-brew install nmap subfinder httpx massdns ffuf amass
-# whois already ships with macOS
-
-go install github.com/d3mondev/puredns/v2@latest
-go install github.com/projectdiscovery/alterx/cmd/alterx@latest
-go install github.com/lc/gau/v2/cmd/gau@latest
-go install github.com/tomnomnom/assetfinder@latest
-go install github.com/tomnomnom/waybackurls@latest
-go install github.com/gwen001/github-subdomains@latest
-
-# make sure Go binaries are on PATH (zsh)
-echo 'export PATH="$PATH:$HOME/go/bin"' >> ~/.zshrc && source ~/.zshrc
-
-# wordlists (auto-detected at this path)
-git clone --depth 1 https://github.com/danielmiessler/SecLists.git ~/SecLists
+python3 setup.py
 ```
 
-### Tool → phase map
+`setup.py` audits the toolchain, prints the exact install command for anything missing (Go tools via `go install`, system tools via brew/apt, SecLists, plus Homebrew/Go themselves), adds `~/go/bin` to your shell PATH, and asks for your **VirusTotal + Chaos** keys (press Enter to skip either). Run `python3 setup.py --check` for a read-only audit.
 
-| Tool | Used for | If missing |
-|------|----------|------------|
-| `subfinder` | passive enumeration | crt.sh still runs |
-| `puredns` (+ `massdns`) | resolution & brute-force | native threaded resolver; brute-force skipped |
-| `alterx` | permutations | skipped |
-| `gau` / `waybackurls` | passive (URL archives) | skipped |
-| `assetfinder` | passive | skipped |
-| `github-subdomains` | passive (needs token) | skipped |
-| `amass` | passive (`--amass`) | skipped |
-| `httpx` | HTTP probing | skipped |
-| `ffuf` | virtual-host enum (`--vhost`) | skipped |
-| `nmap` | port scan (`--ports`) | skipped |
-| `whois` | root domain discovery | skipped |
-| `dig` or `dnspython` | takeover (dead-host CNAMEs) | takeover limited to live hosts |
-
-> Note: API keys for sources like SecurityTrails / Chaos / VirusTotal are configured inside **subfinder's** own config (`~/.config/subfinder/provider-config.yaml`); `recon.py` picks up the extra coverage automatically. (Dedicated key handling in `recon.py` is on the roadmap.)
+`subrecon.py` itself is **stdlib-only** (Python 3.7+); every external tool is optional and just unlocks or improves a phase. With zero tools installed, the native crt.sh source + threaded resolver still produce useful output.
 
 ---
 
@@ -76,134 +24,159 @@ git clone --depth 1 https://github.com/danielmiessler/SecLists.git ~/SecLists
 
 ```bash
 # single target
-python3 subrecon.py -t example.com -o output.txt
+python3 subrecon.py -t example.com -o out.txt
 
 # list of targets
-python3 subrecon.py -T targets.txt -o output.txt
+python3 subrecon.py -T targets.txt -o out.txt
 
-# thorough: big wordlist, validated resolvers, recursion, vhost, JSON
-python3 subrecon.py -t example.com -w ~/SecLists/Discovery/DNS/subdomains-top1million-110000.txt \
-    -r resolvers.txt --recursive --vhost --json -o out.txt
+# thorough: big wordlist, validated resolvers, recursion, vhost, ASN, JSON
+python3 subrecon.py -t example.com \
+    -w ~/SecLists/Discovery/DNS/subdomains-top1million-110000.txt \
+    -r resolvers.txt --recursive --vhost --asn --json -o out.txt
 
 # continuous monitoring with Slack/Discord alerts on new assets
 python3 subrecon.py -t example.com --monitor \
     --notify-webhook https://hooks.slack.com/services/XXX -o out.txt
 ```
 
-`-t` takes a host (`example.com`) or a full URL — scheme, path, port, and `*.` are stripped automatically.
+`-t` takes a host or a full URL — scheme, path, port, and `*.` are stripped automatically.
 
 ---
 
-## How it works (step by step)
+## What it does
 
-### 1. Root domain discovery
-Runs `whois` on the target and extracts the registrant organization. With `--whoxy-key`, it performs a reverse-WHOIS lookup to find other root domains owned by the same org. By default these are only **reported** (so you can verify scope first); `--expand-roots` feeds them back into the pipeline.
+An end-to-end pipeline, every stage **degrading gracefully** (missing tool → phase skipped or native fallback, never a crash):
 
-### 2. Passive enumeration
-Queries every available source in parallel and merges the results:
-- `subfinder` (certificate transparency, DNS aggregators, and any keyed sources you've configured),
-- **crt.sh** natively (with retry/backoff so a 502 doesn't silently drop the source),
-- `gau` / `waybackurls` — extracts hostnames seen in Wayback/CommonCrawl URLs,
-- `assetfinder`,
-- `github-subdomains` (with `--github-token` or `$GITHUB_TOKEN`),
-- `amass` passive (with `--amass`).
-
-Every discovered name is tagged with **which source(s)** found it, so the report shows provenance (`found via: subfinder, wayback`).
-
-### 3. DNS resolution
-Resolves the passive set with `puredns`. Critically, it uses a **two-tier resolver setup**: a large bulk list (`-r`) for mass resolution, then re-validates every hit against a small list of **trusted resolvers** (`--resolvers-trusted`, built-in by default). This is what keeps brute-force output free of false positives caused by broken or poisoned resolvers. If `puredns` isn't available, it falls back to a native threaded resolver that filters apex-level wildcard catch-alls.
-
-### 4. Active discovery
-Three techniques, all feeding the same de-duplicated set:
-- **Brute-force** (`puredns bruteforce`) against your wordlist (auto-detected from SecLists, or `-w`).
-- **Permutations** (`alterx`), seeded from the confirmed-live hosts and **iterated** until a round finds nothing new (`--perm-rounds`, default 2).
-- **Recursive brute-force** (`--recursive`) into discovered subdomains, depth-limited (`--recursion-depth`) with a smaller wordlist — off by default because it's expensive.
-
-Wildcard hits are filtered out of permutation results so a `*.domain` catch-all doesn't make everything look live.
-
-### 5. HTTP probing
-Feeds the resolved set to `httpx` and records status code, title, detected technologies, IP, and CNAME for each live web service.
-
-### 6. Subdomain takeover detection *(on by default)*
-For every host with a CNAME (from httpx) and for dead hosts whose CNAME can be resolved, it checks the CNAME against a built-in fingerprint table (GitHub Pages, S3, Heroku, Shopify, Fastly, and more). A match plus the service's "unclaimed" body signature is reported as **`confirmed`**; a CNAME-only match is reported as **`potential`**. All findings still require **manual verification** before you report them. Disable with `--no-takeover`.
-
-### 7. Virtual-host enumeration *(optional, `--vhost`)*
-Uses the **dead subdomain list** as a `Host`-header wordlist and fuzzes it against each live IP with `ffuf` (auto-calibration filters the default response). This finds internal/staging virtual hosts that have no public DNS record. Needs `ffuf`.
-
-### 8. Port scan *(optional, `--ports`)*
-Runs `nmap -sV` against the unique live IPs (top 1000 ports, or `--full-ports` for all 65535).
-
-### 9. Monitoring / diff *(optional, `--monitor`)*
-Saves a JSON baseline per target under `--state-dir` (default `~/.recon/state`). On the next run it diffs against the baseline and reports **new live**, **no longer live**, and **new dead** subdomains. With `--notify-webhook`, it posts a summary of newly-discovered live assets to a Slack/Discord-compatible webhook. Ideal for a cron job on programs you watch continuously.
+1. **Root discovery** — `whois` registrant org; `--whoxy-key` adds reverse-WHOIS to find sibling roots (reported only unless `--expand-roots`).
+2. **Passive enumeration** — queried in parallel and merged, each name tagged with its source: subfinder, crt.sh, **Chaos**, **VirusTotal**, **certspotter**, **OTX** (all native), gau/waybackurls, assetfinder, github-subdomains, amass (`--amass`).
+3. **TLS-SAN harvest** — pulls hostnames from the certificates of live IPs (catches names absent from CT logs). Disable with `--no-tls-san`.
+4. **DNS resolution** — `puredns` with a **two-tier resolver** setup: bulk list (`-r`) for mass resolution, then re-validation against trusted resolvers to kill false positives. Wildcard catch-alls filtered. Native threaded fallback if `puredns` is absent.
+5. **Active discovery** — brute-force (`puredns` + wordlist), `alterx` permutations (iterated, `--perm-rounds`), and optional recursive brute-force (`--recursive`).
+6. **ASN / CIDR expansion** *(opt-in `--asn`)* — resolves the org's announced IP ranges (RIPEstat) and reverse-DNSes them to find hosts that name-based enumeration misses.
+7. **HTTP probing** — `httpx` records status, title, tech, IP, and CNAME per live service.
+8. **Takeover detection** *(on by default)* — checks CNAMEs against a built-in fingerprint table; `confirmed` vs `potential`, both needing manual verification. Disable with `--no-takeover`.
+9. **Optional** — virtual-host enum (`--vhost`, ffuf, dead names as `Host` headers), port scan (`--ports` / `--full-ports`, nmap), and **monitor mode** (`--monitor`) that diffs against the last run and posts only new assets to a webhook.
 
 ---
 
-## Output files
+## API keys
 
-For `-o output.txt` the tool writes:
+Keys live in **`~/.recon/config`** (`KEY=value`, one per line) — `setup.py` writes them there, or add by hand:
 
-| File | Contents |
-|------|----------|
-| `output.txt` | full human-readable report (everything combined) |
-| `output_live.txt` | live (resolving) subdomains, one per line |
-| `output_dead.txt` | dead (non-resolving) subdomains — your vhost input |
-| `output_vhosts.txt` | discovered virtual hosts (only with `--vhost`) |
-| `output_takeover.txt` | takeover candidates (only if any found) |
-| `output.json` | full structured results (only with `--json`) |
+```
+VT_API_KEY=...
+CHAOS_KEY=...
+```
 
-The report itself lists every subdomain once with its status and the source(s) that found it, plus sections for live web services, takeover candidates, virtual hosts, open ports, and — in monitor mode — changes since the last run.
+`subrecon.py` reads them natively each run (env vars of the same name override the file). **certspotter and OTX need no key.** `github-subdomains` needs `$GITHUB_TOKEN` or `--github-token`.
 
 ---
 
-## Options
+## Common flags
 
 | Flag | Description |
 |------|-------------|
-| `-t, --target` | single target domain |
-| `-T, --targets` | file of target domains (one per line) |
-| `-o, --output` | report file (companions written alongside) |
-| `-w, --wordlist` | brute-force wordlist |
-| `-r, --resolvers` | bulk resolvers file for mass resolution |
-| `--resolvers-trusted` | trusted resolvers for re-validation (default: built-in) |
+| `-t` / `-T` | single target / file of targets |
+| `-o` | report file (companions written alongside) |
+| `-w` / `-r` | brute-force wordlist / bulk resolvers file |
 | `--passive-only` | passive enumeration + resolution only |
-| `--no-bruteforce` / `--no-permutations` / `--no-httpx` / `--no-takeover` | skip a phase |
-| `--perm-rounds N` | max permutation rounds (default 2) |
-| `--recursive` / `--recursion-depth N` / `--recursion-wordlist` | recursive brute-force |
-| `--vhost` | virtual-host enumeration (needs ffuf) |
-| `--ports` / `--full-ports` | nmap port scan |
-| `--amass` | add amass as a passive source |
-| `--github-token` | token for github-subdomains (or `$GITHUB_TOKEN`) |
-| `--expand-roots` | run the full pipeline on WHOIS-discovered roots |
-| `--whoxy-key` | whoxy.com key for reverse WHOIS |
-| `--monitor` / `--state-dir` / `--notify-webhook` | monitoring & alerts |
+| `--recursive` / `--vhost` / `--ports` / `--asn` | enable the heavier optional phases |
+| `--no-bruteforce` / `--no-permutations` / `--no-takeover` / `--no-tls-san` | skip a phase |
+| `--monitor` / `--notify-webhook` | diff vs last run + alert on new assets |
 | `--json` | also write `<output>.json` |
-| `--threads N` | concurrency for the native resolver fallback |
-| `-v, --verbose` | show child-process stderr (debug missing/failing tools) |
+| `-v` | show child-process stderr (debug missing/failing tools) |
+
+Full list: `python3 subrecon.py -h`.
+
+## Output
+
+For `-o out.txt`: `out.txt` (full report), `out_live.txt` / `out_dead.txt` (resolving / non-resolving subs), `out_vhosts.txt` (`--vhost`), `out_takeover.txt` (if any), `out.json` (`--json`).
 
 ---
 
-## Notes & caveats
+## Claude-BugHunter integration
 
-- **Resolver quality matters.** Without a large validated bulk list via `-r` (e.g. [trickest/resolvers](https://github.com/trickest/resolvers)), the tool reuses its small built-in list for everything; resolution still works but heavy brute-force is less reliable.
-- **Takeover findings are heuristic.** Always confirm manually before claiming a takeover — third-party services change behaviour and false positives happen.
-- **macOS file-descriptor limit.** Before very large brute-force runs, raise it with `ulimit -n 10000`.
-- **Optional source tools vary by version.** Each passive source is best-effort and skipped on error; run with `-v` to see if one is failing.
-- **Scope discipline.** Related root domains are reported, not auto-attacked, unless you pass `--expand-roots`.
+`subrecon.py` slots into [Claude-BugHunter](https://github.com/elementalsouls/Claude-BugHunter) as the horizontal asset-discovery layer behind its `/recon` command — the step BugHunter deliberately leaves thin. Two ways to wire it in; pick one.
+
+### Method 1 — `integrate.sh` (deterministic)
+
+Run once in a **normal terminal** (Claude not needed), pointing at your Claude-BugHunter checkout:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tburakdirlik/BB_WORKFLOW/refs/heads/main/integrate.sh -o integrate.sh
+bash integrate.sh /path/to/Claude-BugHunter
+#   or, from inside the repo: cd Claude-BugHunter && bash integrate.sh
+```
+
+It downloads `subrecon.py` + `setup.py` into `engine/`, adds a `/recon-setup` command, rewires `/recon` Step 1+2 to call `subrecon.py` (Steps 3–9 untouched, backup at `commands/recon.md.bak`), and runs `scripts/install.sh`. **Idempotent** — safe to re-run.
+
+### Method 2 — integration prompt (Claude-driven)
+
+Prefer Claude to do it (and review each edit)? Start `claude` from the repo root, then copy everything between `PROMPT START` and `PROMPT END` and paste it. It makes the same file changes, described step by step — plain text, so it pastes cleanly.
+
+```text
+================== PROMPT START ==================
+You are in the Claude-BugHunter repo. Wire my subdomain-enumeration tool
+subrecon.py into the /recon pipeline as a durable, file-based change. Do EXACTLY
+the steps below and nothing more. Do not commit or push.
+
+1. Download my tool and installer into the engine:
+     curl -fsSL https://raw.githubusercontent.com/tburakdirlik/BB_WORKFLOW/refs/heads/main/subrecon.py -o engine/subrecon.py
+     curl -fsSL https://raw.githubusercontent.com/tburakdirlik/BB_WORKFLOW/refs/heads/main/setup.py    -o engine/setup.py
+     chmod +x engine/subrecon.py engine/setup.py
+
+2. Edit commands/recon.md. First copy it to commands/recon.md.bak. Then replace
+   the whole section from the line   ### Step 1: Subdomain Enumeration   up to
+   (but NOT including) the line   ### Step 3: URL Crawl   with a new section
+   titled   ### Step 1+2: Asset Discovery (subdomain enum + live hosts + takeover)
+   The new section must hold ONE bash code block that runs, in this order:
+     TARGET="$1"
+     mkdir -p recon/$TARGET
+     python3 engine/subrecon.py -t "$TARGET" -o recon/$TARGET/subrecon.txt --json
+     cp recon/$TARGET/subrecon_live.txt recon/$TARGET/subdomains.txt 2>/dev/null
+     httpx -l recon/$TARGET/subdomains.txt -silent -status-code -title -tech-detect | tee recon/$TARGET/live-hosts.txt
+   Add one line under it: takeover candidates are already in subrecon.txt
+   (subrecon runs its own takeover scan), so the later subzy step stays only as a
+   cross-check. Leave Steps 3 through 9 completely untouched.
+
+3. Create commands/recon-setup.md: a /recon-setup slash command with YAML
+   frontmatter (a   name: recon-setup   line and a one-line   description: ).
+   Its body tells the user to run   python3 engine/setup.py --check   to see what
+   is missing, install the missing tools, and configure VirusTotal + Chaos keys
+   by running   python3 engine/setup.py   in their OWN terminal so secrets never
+   pass through chat. certspotter and OTX need no key.
+
+4. Run   ./scripts/install.sh   so the updated commands reach ~/.claude/commands/.
+
+5. Report exactly which files you created or modified. Do not commit, do not
+   push, do not touch anything outside engine/ and commands/.
+
+Notes: subrecon.py reads VirusTotal/Chaos keys natively from ~/.recon/config, so
+it needs no code changes. Its outputs are subrecon_live.txt / subrecon_dead.txt /
+subrecon.json next to the -o path; the commands above map those into the
+subdomains.txt and live-hosts.txt that the later steps consume.
+=================== PROMPT END ===================
+```
+
+### After either method
+
+Inside Claude, from the repo root:
+
+```
+/recon-setup          # install the recon toolchain (asks VirusTotal + Chaos)
+/recon target.com     # full pipeline — now front-ended by subrecon.py
+```
+
+> Start `claude` from the repo root so the relative `engine/` paths resolve. `integrate.sh` fetches `subrecon.py`/`setup.py` from this repo's raw URLs, so make sure they're pushed here first (override with `SUBRECON_URL=` / `SETUP_URL=` otherwise).
 
 ---
 
-## Roadmap / ideas for the next version
+## Notes
 
-- **More passive sources** — Chaos (ProjectDiscovery dataset), native Wayback/CommonCrawl/OTX queries (fewer tool dependencies), and certspotter as an additional CT source.
-- **TLS SAN scraping** — pull hostnames from the certificates of live IPs (`tlsx`-style); catches names that never appear in CT logs.
-- **Per-source coverage summary** — end-of-run report of how many subdomains each source contributed (and which silently returned nothing), for completeness confidence.
-- **Resume / checkpointing** — persist progress so a long run can resume after a crash or Ctrl+C instead of only writing partial results.
-- **Per-level wildcard detection** on the native resolver path (currently apex-level only).
-- **ASN / CIDR expansion** — discover the org's IP ranges and reverse-DNS them to find hosts that DNS-name enumeration misses.
-- **Native VirusTotal source** (`--vt-key`) so it doesn't depend on subfinder being configured, plus first-class API-key management.
-- **nuclei integration** — run takeover and exposure templates against the live set for higher-coverage detection.
-- **Rate-limit / politeness controls** — global throttle and per-host rate limits for programs that require gentle scanning.
-- **Target-level parallelism** — process multiple `-T` targets concurrently (with rate-limit awareness).
+- **Resolver quality matters.** Supply a large validated bulk list via `-r` (e.g. [trickest/resolvers](https://github.com/trickest/resolvers)) for reliable heavy brute-force; without it the small built-in list is reused.
+- **Takeover findings are heuristic** — always confirm manually before reporting.
+- **macOS fd limit** — `ulimit -n 10000` before very large brute-force runs.
 
+---
 
-Aracın iş akışı oluşturulmasına sırasında refarans site olarak https://www.wiz.io/bug-bounty-masterclass/reconnaissance/overview kullanıldı. 
+Aracın iş akışı oluşturulması sırasında referans site olarak <https://www.wiz.io/bug-bounty-masterclass/reconnaissance/overview> kullanıldı.
