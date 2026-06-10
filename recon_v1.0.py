@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-recon.py - subdomain enumeration & attack-surface mapping pipeline  -  recon_v1.3.py
+subrecon.py - subdomain enumeration & attack-surface mapping pipeline
 
 Goal: enumerate *all* live subdomains of a target as completely and
 accurately as possible, and separately surface the dead (non-resolving)
@@ -9,12 +9,14 @@ names so they can be reused for virtual-host enumeration.
 Pipeline per target:
     root domain discovery (whois / whoxy)
       -> passive enumeration   (subfinder, crt.sh, Chaos, VirusTotal,
-                                 gau/waybackurls, assetfinder,
-                                 github-subdomains, amass)
+                                 certspotter, OTX, gau/waybackurls,
+                                 assetfinder, github-subdomains, amass)
       -> DNS resolution        (puredns: bulk resolve + trusted re-validation,
                                  native threaded fallback)
       -> active discovery      (puredns bruteforce, alterx permutations,
                                  optional recursive bruteforce)
+      -> TLS SAN harvesting     (read live certificates for non-CT names)
+      -> ASN/CIDR expansion     (opt-in: org ranges -> reverse DNS)
       -> HTTP probing          (httpx)
       -> virtual-host enum      (ffuf, optional, uses the dead list)
       -> port scan             (nmap, optional)
@@ -38,6 +40,7 @@ Only test assets you are explicitly authorized to assess.
 import argparse
 import json
 import os
+import ipaddress
 import random
 import re
 import shutil
@@ -370,6 +373,84 @@ def virustotal_source(domain, api_key, max_pages=15, page_size=40, pause=1.0):
     return found, status
 
 
+def certspotter_source(domain, api_key=None, max_pages=10, retries=3):
+    """
+    Cert Spotter (SSLMate) CT search - native, works without a key (free tier is
+    rate-limited; an optional token raises the limit). Paginates with the
+    `after` cursor until an empty array, with retry/backoff per page so a
+    transient 5xx/429/network blip doesn't drop the whole source. Returns
+    (set, status).
+    """
+    found = set()
+    after = None
+    status = "ok"
+    base = (f"https://api.certspotter.com/v1/issuances?domain={urllib.parse.quote(domain)}"
+            f"&include_subdomains=true&expand=dns_names")
+    headers = {"User-Agent": "recon.py/2.1", "Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    for _ in range(max_pages):
+        url = base + (f"&after={urllib.parse.quote(str(after))}" if after else "")
+        data = None
+        for attempt in range(retries):
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = json.loads(resp.read().decode("utf-8", "replace"))
+                break
+            except urllib.error.HTTPError as e:
+                note = "rate limit (429)" if e.code == 429 else f"HTTP {e.code}"
+                if attempt < retries - 1:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                warn(f"certspotter query failed after {retries} tries: {note}")
+                status = "partial" if found else "error"
+            except Exception as e:
+                if attempt < retries - 1:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                warn(f"certspotter query failed after {retries} tries: {e}")
+                status = "partial" if found else "error"
+        if data is None:                   # all retries exhausted for this page
+            break
+        if not data:                       # empty array -> no more pages
+            break
+        for issuance in data:
+            for n in issuance.get("dns_names", []):
+                n = str(n).strip().lower().strip(".").lstrip("*.")
+                if n and in_scope(n, domain):
+                    found.add(n)
+        after = data[-1].get("id")
+        if not after:
+            break
+    return found, status
+
+
+def otx_source(domain, api_key=None):
+    """
+    AlienVault OTX passive DNS - native, works without a key (an optional key is
+    sent as X-OTX-API-KEY). Returns (set, status).
+    """
+    url = (f"https://otx.alienvault.com/api/v1/indicators/domain/"
+           f"{urllib.parse.quote(domain)}/passive_dns")
+    headers = {"User-Agent": "recon.py/2.1", "Accept": "application/json"}
+    if api_key:
+        headers["X-OTX-API-KEY"] = api_key
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as e:
+        warn(f"otx query failed: {e}")
+        return set(), "error"
+    found = set()
+    for rec in data.get("passive_dns", []):
+        h = str(rec.get("hostname", "")).strip().lower().strip(".").lstrip("*.")
+        if h and in_scope(h, domain):
+            found.add(h)
+    return found, "ok"
+
+
 def passive_enum(domain, amass=False, github_token=None, keys=None):
     """
     Query every available passive source.
@@ -428,6 +509,14 @@ def passive_enum(domain, amass=False, github_token=None, keys=None):
     else:
         info("virustotal: no API key - skipping (set VT_API_KEY or add to config)")
         skip("virustotal", "no-key")
+
+    info("querying certspotter (certificate transparency) ...")
+    names, st = certspotter_source(domain, keys.get("certspotter"))
+    add(names, "certspotter", status=st)
+
+    info("querying OTX (alienvault passive DNS) ...")
+    names, st = otx_source(domain, keys.get("otx"))
+    add(names, "otx", status=st)
 
     if have("gau"):
         add(hosts_from_urls(run_stream(["gau", "--subs", domain], quiet=True) or [], domain),
@@ -1073,6 +1162,8 @@ def summarize_tools():
 KEY_ENV = {
     "virustotal": ["VT_API_KEY", "VIRUSTOTAL_API_KEY", "VIRUSTOTAL_KEY"],
     "chaos": ["CHAOS_KEY", "PDCP_API_KEY", "CHAOS_API_KEY"],
+    "certspotter": ["CERTSPOTTER_API_KEY", "CERTSPOTTER_KEY"],
+    "otx": ["OTX_API_KEY", "OTX_KEY"],
 }
 DEFAULT_KEY_CONFIG = "~/.recon/config"
 
@@ -1147,6 +1238,227 @@ def print_source_coverage(stats):
             print(C.w(C.GREEN if total else C.GREY, line))
         else:
             print(C.w(C.GREY, f"    {src:<14}   (skipped: {label.get(status, status)})"))
+
+
+# --------------------------------------------------------------------------- #
+# TLS SAN harvesting (native, stdlib only) - names from live certificates
+# --------------------------------------------------------------------------- #
+_SAN_OID = b"\x06\x03\x55\x1d\x11"      # DER encoding of OID 2.5.29.17 (subjectAltName)
+
+
+def _der_len(buf, i):
+    """Read a DER length field at offset i. Returns (length, next_offset)."""
+    n = buf[i]
+    i += 1
+    if n < 0x80:
+        return n, i
+    num = n & 0x7f
+    return int.from_bytes(buf[i:i + num], "big"), i + num
+
+
+def _san_from_der(der):
+    """
+    Extract dNSName entries from the subjectAltName extension of a DER-encoded
+    certificate with a minimal TLV walk (no external deps). Best-effort: returns
+    a set of hostnames (lowercased, wildcard prefixes stripped).
+    """
+    names = set()
+    pos = der.find(_SAN_OID)
+    if pos < 0:
+        return names
+    i = pos + len(_SAN_OID)
+    if i < len(der) and der[i] == 0x01:          # optional critical BOOLEAN
+        ln, i = _der_len(der, i + 1)
+        i += ln
+    if i >= len(der) or der[i] != 0x04:          # extnValue OCTET STRING
+        return names
+    _, i = _der_len(der, i + 1)
+    if i >= len(der) or der[i] != 0x30:          # GeneralNames SEQUENCE
+        return names
+    seq_len, i = _der_len(der, i + 1)
+    end = min(i + seq_len, len(der))
+    while i < end:
+        tag = der[i]
+        i += 1
+        ln, i = _der_len(der, i)
+        val = der[i:i + ln]
+        i += ln
+        if tag == 0x82:                          # [2] dNSName (IA5String)
+            try:
+                h = val.decode("ascii").strip().lower().strip(".").lstrip("*.")
+            except UnicodeDecodeError:
+                continue
+            if h:
+                names.add(h)
+    return names
+
+
+def _is_ip_literal(s):
+    try:
+        socket.inet_aton(s)
+        return True
+    except OSError:
+        return False
+
+
+def _cert_san(host, port=443, timeout=8):
+    """Connect over TLS, grab the peer certificate (DER), return its SAN names."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    server_name = None if _is_ip_literal(host) else host
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=server_name) as ssock:
+                der = ssock.getpeercert(binary_form=True)
+        return _san_from_der(der) if der else set()
+    except Exception:
+        return set()
+
+
+def tls_san_scan(hosts, domain, threads=50, port=443):
+    """
+    Connect to each live host on TLS, read its certificate's SANs, and return
+    the in-scope hostnames found - including names that never appear in CT logs
+    (internal/self-signed certs, certs on IPs, freshly issued certs).
+    """
+    hosts = [h for h in set(hosts) if h]
+    found = set()
+    if not hosts:
+        return found
+    info(f"reading certificates from {len(hosts)} live host(s) ...")
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        futs = [ex.submit(_cert_san, h, port) for h in hosts]
+        for fut in as_completed(futs):
+            for n in fut.result():
+                if in_scope(n, domain):
+                    found.add(n)
+    return found
+
+
+# --------------------------------------------------------------------------- #
+# ASN / CIDR expansion (opt-in) - IP-first discovery via reverse DNS
+# --------------------------------------------------------------------------- #
+# Holders we never expand: shared cloud/CDN ranges yield noise, not the org.
+CLOUD_ASN_KEYWORDS = (
+    "cloudflare", "amazon", "aws", "google", "microsoft", "azure", "akamai",
+    "fastly", "oracle", "digitalocean", "linode", "ovh", "hetzner", "vultr",
+    "godaddy", "namecheap", "incapsula", "imperva", "sucuri", "stackpath",
+    "automattic", "shopify", "squarespace", "wix", "alibaba", "tencent",
+    "leaseweb", "contabo", "scaleway", "gcore", "bunny", "cloudfront",
+)
+
+
+def _ripe_json(datacall, resource):
+    """Query a RIPEstat data call (free, no key). Returns the 'data' object."""
+    url = (f"https://stat.ripe.net/data/{datacall}/data.json"
+           f"?resource={urllib.parse.quote(str(resource))}&sourceapp=recon-py")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "recon.py/2.1"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace")).get("data", {})
+    except Exception as e:
+        warn(f"ripestat {datacall} failed for {resource}: {e}")
+        return {}
+
+
+def asn_for_ip(ip):
+    """Announcing ASN(s) for an IP (RIPEstat network-info)."""
+    return [str(a) for a in (_ripe_json("network-info", ip).get("asns") or [])]
+
+
+def asn_holder(asn):
+    """Holder/org name for an ASN (RIPEstat as-overview) - used for cloud filter."""
+    return (_ripe_json("as-overview", f"AS{asn}").get("holder") or "").strip()
+
+
+def asn_prefixes(asn):
+    """IPv4 CIDR prefixes announced by an ASN (RIPEstat announced-prefixes)."""
+    out = []
+    for p in _ripe_json("announced-prefixes", f"AS{asn}").get("prefixes", []):
+        pref = p.get("prefix", "")
+        if pref and ":" not in pref:             # IPv4 only
+            out.append(pref)
+    return out
+
+
+def reverse_dns(ips, threads=50):
+    """PTR lookups for a set of IPs. Returns {ip: hostname}."""
+    out = {}
+    socket.setdefaulttimeout(4)
+
+    def ptr(ip):
+        try:
+            return ip, socket.gethostbyaddr(ip)[0].strip(".").lower()
+        except (socket.herror, socket.gaierror, socket.timeout, OSError):
+            return ip, None
+
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        for ip, name in ex.map(ptr, list(ips)):
+            if name:
+                out[ip] = name
+    return out
+
+
+def asn_expand(seed_ips, domain, threads=50, max_ips=8192):
+    """
+    IP-first discovery. From known live IPs, find the org's ASNs, expand their
+    announced IPv4 prefixes, reverse-DNS the addresses, and return in-scope
+    hostnames that name enumeration would miss. Skips shared cloud/CDN ASNs and
+    caps the number of addresses probed.
+    """
+    seed_ips = [ip for ip in set(seed_ips) if ip and ":" not in ip]
+    if not seed_ips:
+        info("no seed IPs for ASN expansion")
+        return set()
+
+    asns = set()
+    for ip in seed_ips:
+        asns.update(asn_for_ip(ip))
+    if not asns:
+        info("no ASNs resolved for seed IPs")
+        return set()
+
+    keep = []
+    for a in sorted(asns):
+        holder = asn_holder(a)
+        if any(k in holder.lower() for k in CLOUD_ASN_KEYWORDS):
+            info(f"skipping AS{a} ({holder or 'unknown'}) - shared cloud/CDN range")
+            continue
+        keep.append((a, holder))
+    if not keep:
+        info("all candidate ASNs are shared cloud/CDN - nothing to expand "
+             "(target has no own IP space)")
+        return set()
+
+    cidrs = []
+    for a, holder in keep:
+        good(f"expanding AS{a} ({holder or 'unknown holder'})")
+        cidrs.extend(asn_prefixes(a))
+    cidrs = sorted(set(cidrs),
+                   key=lambda c: ipaddress.ip_network(c, strict=False).num_addresses)
+
+    targets = []
+    for c in cidrs:
+        try:
+            net = ipaddress.ip_network(c, strict=False)
+        except ValueError:
+            continue
+        for ip in net.hosts():
+            targets.append(str(ip))
+            if len(targets) >= max_ips:
+                break
+        if len(targets) >= max_ips:
+            warn(f"ASN address cap ({max_ips}) reached - stopping (raise with --asn-max-ips)")
+            break
+    if not targets:
+        return set()
+
+    info(f"reverse-DNS on {len(targets)} address(es) across {len(cidrs)} prefix(es) ...")
+    ptr = reverse_dns(targets, threads)
+    found = {name for name in ptr.values() if in_scope(name, domain)}
+    good(f"{len(found)} in-scope name(s) from reverse DNS ({len(ptr)} PTR records seen)")
+    return found
 
 
 # --------------------------------------------------------------------------- #
@@ -1256,6 +1568,37 @@ def run_pipeline(domain, args, ctx, queue, visited):
                     nxt.extend(sorted(new))
                 current = nxt
                 depth += 1
+
+    # Phase 3d - TLS SAN harvest from live certificates (catches non-CT names)
+    if not args.passive_only and not args.no_tls_san and resolved:
+        phase(f"TLS SAN harvesting - {domain}")
+        san_names = tls_san_scan(resolved, domain, threads=args.threads)
+        if san_names:
+            tag(san_names, "tls-san")
+            new = san_names - resolved
+            if new:
+                live = resolve_hosts(new, bulk, trusted, args.threads)
+                resolved |= live
+                good(f"{len(san_names)} SAN name(s); {len(live)} newly live")
+            else:
+                good(f"{len(san_names)} SAN name(s); none new")
+        else:
+            good("no SAN names harvested")
+
+    # Phase 3e - ASN / CIDR expansion + reverse DNS (opt-in; org-owned ranges)
+    if not args.passive_only and args.asn:
+        phase(f"ASN / CIDR expansion - {domain}")
+        seed_ips = ips_from_hosts(resolved)
+        asn_names = asn_expand(seed_ips, domain, threads=args.threads, max_ips=args.asn_max_ips)
+        if asn_names:
+            tag(asn_names, "asn-ptr")
+            new = asn_names - resolved
+            if new:
+                live = resolve_hosts(new, bulk, trusted, args.threads)
+                resolved |= live
+                good(f"{len(asn_names)} in-scope name(s); {len(live)} newly live")
+            else:
+                good(f"{len(asn_names)} in-scope name(s); none new")
 
     result["resolved"] = resolved
     result["unresolved"] = set(sources) - resolved
@@ -1535,6 +1878,13 @@ def parse_args():
     p.add_argument("--whoxy-key", help="whoxy.com API key for reverse WHOIS")
     p.add_argument("--no-takeover", action="store_true",
                    help="disable subdomain takeover detection (on by default)")
+    p.add_argument("--no-tls-san", action="store_true",
+                   help="disable TLS SAN harvesting from live certificates (on by default)")
+    p.add_argument("--asn", action="store_true",
+                   help="ASN/CIDR expansion + reverse DNS (opt-in; expands only org-owned "
+                        "ranges, skips shared cloud/CDN ASNs)")
+    p.add_argument("--asn-max-ips", type=int, default=8192,
+                   help="max addresses to reverse-DNS during ASN expansion (default: 8192)")
     p.add_argument("--monitor", action="store_true",
                    help="diff against the previous run, save a baseline, highlight new assets")
     p.add_argument("--state-dir", default="~/.recon/state",
