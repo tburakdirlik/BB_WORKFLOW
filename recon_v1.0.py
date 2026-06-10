@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-recon.py - subdomain enumeration & attack-surface mapping pipeline - recon_v1.1.py
+recon.py - subdomain enumeration & attack-surface mapping pipeline
 
 Goal: enumerate *all* live subdomains of a target as completely and
 accurately as possible, and separately surface the dead (non-resolving)
@@ -41,12 +41,14 @@ import random
 import re
 import shutil
 import socket
+import ssl
 import string
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -614,6 +616,237 @@ def vhost_enum(dead_hosts, live_ips, schemes=("https", "http")):
 
 
 # --------------------------------------------------------------------------- #
+# Subdomain takeover detection
+# --------------------------------------------------------------------------- #
+# Curated fingerprints (subset of can-i-take-over-xyz). A match on `cnames`
+# plus the `fingerprint` string in the body is a high-confidence takeover.
+# All findings still require manual verification before reporting.
+TAKEOVER_FINGERPRINTS = [
+    {"service": "GitHub Pages", "cnames": ["github.io"],
+     "fingerprint": "There isn't a GitHub Pages site here"},
+    {"service": "AWS S3", "cnames": ["amazonaws.com"],
+     "fingerprint": "The specified bucket does not exist"},
+    {"service": "Heroku", "cnames": ["herokuapp.com", "herokudns.com", "herokussl.com"],
+     "fingerprint": "No such app"},
+    {"service": "Shopify", "cnames": ["myshopify.com"],
+     "fingerprint": "Sorry, this shop is currently unavailable"},
+    {"service": "Fastly", "cnames": ["fastly.net"],
+     "fingerprint": "Fastly error: unknown domain"},
+    {"service": "Tumblr", "cnames": ["domains.tumblr.com"],
+     "fingerprint": "Whatever you were looking for doesn't currently exist at this address"},
+    {"service": "Surge.sh", "cnames": ["surge.sh"],
+     "fingerprint": "project not found"},
+    {"service": "Bitbucket", "cnames": ["bitbucket.io"],
+     "fingerprint": "Repository not found"},
+    {"service": "Ghost", "cnames": ["ghost.io"],
+     "fingerprint": "The thing you were looking for is no longer here"},
+    {"service": "Pantheon", "cnames": ["pantheonsite.io"],
+     "fingerprint": "The gods are wise, but do not know of the site which you seek"},
+    {"service": "Webflow", "cnames": ["proxy-ssl.webflow.com", "webflow.io"],
+     "fingerprint": "The page you are looking for doesn't exist or has been moved"},
+    {"service": "WordPress", "cnames": ["wordpress.com"],
+     "fingerprint": "Do you want to register"},
+    {"service": "Zendesk", "cnames": ["zendesk.com"],
+     "fingerprint": "Help Center Closed"},
+    {"service": "Help Scout", "cnames": ["helpscoutdocs.com"],
+     "fingerprint": "No settings were found for this company"},
+    {"service": "Cargo", "cnames": ["cargocollective.com"],
+     "fingerprint": "If you're moving your domain away from Cargo"},
+    {"service": "Readme.io", "cnames": ["readme.io"],
+     "fingerprint": "Project doesnt exist... yet!"},
+    {"service": "Unbounce", "cnames": ["unbouncepages.com"],
+     "fingerprint": "The requested URL was not found on this server"},
+    {"service": "Netlify", "cnames": ["netlify.app", "netlify.com"],
+     "fingerprint": "Not Found - Request ID"},
+]
+
+_NOVERIFY_SSL = ssl.create_default_context()
+_NOVERIFY_SSL.check_hostname = False
+_NOVERIFY_SSL.verify_mode = ssl.CERT_NONE
+
+
+def _has_dnspython():
+    try:
+        import dns.resolver  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def resolve_cname(host):
+    """Return the CNAME target for host (dnspython > dig > None)."""
+    try:
+        import dns.resolver  # type: ignore
+        try:
+            ans = dns.resolver.resolve(host, "CNAME")
+            return str(ans[0].target).rstrip(".").lower()
+        except Exception:
+            return None
+    except ImportError:
+        pass
+    if have("dig"):
+        for l in (run_stream(["dig", "+short", "CNAME", host], quiet=True) or []):
+            l = l.strip().rstrip(".").lower()
+            if l:
+                return l
+    return None
+
+
+def http_get(url, timeout=8):
+    """Native GET returning (status, body[:64k]) or (None, '') on failure."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "recon.py/2.0"})
+        with urllib.request.urlopen(req, timeout=timeout, context=_NOVERIFY_SSL) as resp:
+            return resp.status, resp.read(65536).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read(65536).decode("utf-8", "replace")
+        except Exception:
+            return e.code, ""
+    except Exception:
+        return None, ""
+
+
+def takeover_scan(http_results, dead_hosts, threads=30):
+    """
+    Detect dangling subdomains pointing to unclaimed third-party services.
+
+    Candidates = live hosts whose CNAME (from httpx) matches a known service,
+    plus dead hosts whose CNAME we can resolve. A body-fingerprint match is
+    'confirmed'; a CNAME-only match is 'potential' (verify manually).
+    Returns [{host, cname, service, confidence}].
+    """
+    candidates = {}
+
+    for r in http_results:
+        cn = r.get("cname") or []
+        cn = cn[0] if isinstance(cn, list) and cn else (cn if isinstance(cn, str) else "")
+        host = urllib.parse.urlsplit(r.get("url", "")).hostname or ""
+        if cn and host:
+            candidates[host] = cn.rstrip(".").lower()
+
+    dead_list = sorted(h for h in dead_hosts if h not in candidates)
+    if dead_list:
+        if _has_dnspython() or have("dig"):
+            with ThreadPoolExecutor(max_workers=threads) as ex:
+                for h, c in zip(dead_list, ex.map(resolve_cname, dead_list)):
+                    if c:
+                        candidates[h] = c
+        else:
+            info("no CNAME resolver (dnspython/dig) - takeover check limited to live hosts")
+
+    findings = []
+    for host, cname in candidates.items():
+        fp = next((f for f in TAKEOVER_FINGERPRINTS
+                   if any(p in cname for p in f["cnames"])), None)
+        if not fp:
+            continue
+        confidence = "potential"
+        for scheme in ("https", "http"):
+            _, body = http_get(f"{scheme}://{host}/")
+            if body and fp["fingerprint"].lower() in body.lower():
+                confidence = "confirmed"
+                break
+        findings.append({"host": host, "cname": cname,
+                         "service": fp["service"], "confidence": confidence})
+        colour = C.RED if confidence == "confirmed" else C.YELLOW
+        print(C.w(colour, f"    [{confidence}] {host} -> {cname}  ({fp['service']})"))
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# Monitoring / diff + structured (JSON) output
+# --------------------------------------------------------------------------- #
+def result_to_dict(r):
+    """Serialize a result (sets -> sorted lists) for JSON / state."""
+    return {
+        "target": r["target"],
+        "org": r["org"],
+        "extra_roots": sorted(r["extra_roots"]),
+        "live": sorted(r["resolved"]),
+        "dead": sorted(r["unresolved"]),
+        "sources": {k: sorted(v) for k, v in r.get("sources", {}).items()},
+        "http": r["http"],
+        "vhosts": {ip: [list(t) for t in hits] for ip, hits in r["vhosts"].items()},
+        "takeover": r.get("takeover", []),
+        "ports": r["ports"],
+        "diff": r.get("diff", {}),
+    }
+
+
+def write_json(results, output_path):
+    path = os.path.splitext(output_path)[0] + ".json"
+    data = {"generated": datetime.now().isoformat(timespec="seconds"),
+            "targets": [result_to_dict(r) for r in results]}
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        return path
+    except OSError as e:
+        err(f"failed to write JSON: {e}")
+        return None
+
+
+def _state_path(state_dir, target):
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", target)
+    return os.path.join(os.path.expanduser(state_dir), safe + ".json")
+
+
+def load_state(state_dir, target):
+    try:
+        with open(_state_path(state_dir, target)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(state_dir, target, result):
+    d = os.path.expanduser(state_dir)
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(_state_path(state_dir, target), "w") as f:
+            json.dump(result_to_dict(result), f, indent=2)
+    except OSError as e:
+        warn(f"could not save monitoring state for {target}: {e}")
+
+
+def diff_results(prev, result):
+    if not prev:
+        return {"first_run": True, "new_live": [], "gone_live": [], "new_dead": []}
+    prev_live = set(prev.get("live", []))
+    prev_dead = set(prev.get("dead", []))
+    return {
+        "first_run": False,
+        "new_live": sorted(result["resolved"] - prev_live),
+        "gone_live": sorted(prev_live - result["resolved"]),
+        "new_dead": sorted(result["unresolved"] - prev_dead),
+    }
+
+
+def notify_webhook(url, message):
+    payload = json.dumps({"text": message, "content": message}).encode()
+    try:
+        req = urllib.request.Request(url, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=15)
+        good("webhook notification sent")
+    except Exception as e:
+        warn(f"webhook notify failed: {e}")
+
+
+def build_diff_message(results):
+    lines = []
+    for r in results:
+        nl = (r.get("diff") or {}).get("new_live", [])
+        if nl:
+            lines.append(f"[recon] {r['target']}: {len(nl)} new live subdomain(s)")
+            lines += [f"  + {h}" for h in nl[:25]]
+            if len(nl) > 25:
+                lines.append(f"  ... and {len(nl) - 25} more")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
 # Setup helpers (resolvers / wordlists / tool summary)
 # --------------------------------------------------------------------------- #
 TRUSTED_RESOLVERS = ["1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4",
@@ -716,7 +949,7 @@ def run_pipeline(domain, args, ctx, queue, visited):
     result = {
         "target": domain, "org": None, "extra_roots": set(),
         "resolved": set(), "unresolved": set(), "sources": {},
-        "http": [], "vhosts": {}, "ports": {},
+        "http": [], "vhosts": {}, "ports": {}, "takeover": [], "diff": {},
     }
     sources = result["sources"]
 
@@ -822,6 +1055,12 @@ def run_pipeline(domain, args, ctx, queue, visited):
         result["http"] = probe_http(resolved)
         good(f"{len(result['http'])} live web services")
 
+    # Subdomain takeover detection (uses httpx CNAMEs + dangling dead-host CNAMEs)
+    if not args.no_takeover and not args.passive_only:
+        phase(f"subdomain takeover detection - {domain}")
+        result["takeover"] = takeover_scan(result["http"], result["unresolved"], args.threads)
+        good(f"{len(result['takeover'])} takeover candidate(s)")
+
     # Virtual-host enumeration (uses the dead list)
     if args.vhost and not args.passive_only:
         dead = result["unresolved"]
@@ -868,9 +1107,12 @@ def write_report(results, path, elapsed):
     total_dead = sum(len(r["unresolved"]) for r in results)
     total_web = sum(len(r["http"]) for r in results)
     total_vh = sum(sum(len(v) for v in r["vhosts"].values()) for r in results)
+    total_to = sum(len(r.get("takeover", [])) for r in results)
+    total_new = sum(len((r.get("diff") or {}).get("new_live", [])) for r in results)
     A(f"SUMMARY: {len(results)} target(s) | {total_found} subdomains found "
       f"({total_live} live / {total_dead} dead) | {total_web} live web services "
-      f"| {total_vh} virtual-host hits")
+      f"| {total_vh} vhost hits | {total_to} takeover candidates"
+      + (f" | {total_new} NEW since last run" if total_new else ""))
     A("")
 
     for r in results:
@@ -878,6 +1120,24 @@ def write_report(results, path, elapsed):
         A(f" TARGET: {r['target']}")
         A("=" * 80)
         A("")
+
+        d = r.get("diff") or {}
+        if d.get("first_run"):
+            A("--- CHANGES SINCE LAST RUN ---")
+            A("  (first run - baseline saved)")
+            A("")
+        elif d:
+            nl, gl = d.get("new_live", []), d.get("gone_live", [])
+            if nl or gl:
+                A("--- CHANGES SINCE LAST RUN ---")
+                A(f"  new live [{len(nl)}]:")
+                for h in nl:
+                    A(f"    + {h}")
+                if gl:
+                    A(f"  no longer live [{len(gl)}]:")
+                    for h in gl:
+                        A(f"    - {h}")
+                A("")
 
         A("--- ROOT DOMAINS ---")
         A(f"  registrant organization : {r['org'] or '(not found / redacted)'}")
@@ -927,6 +1187,12 @@ def write_report(results, path, elapsed):
                     A(f"    {scheme}://{ip}  Host: {host}  [{status}] ({length} bytes)")
             A("")
 
+        if r.get("takeover"):
+            A(f"--- SUBDOMAIN TAKEOVER CANDIDATES [{len(r['takeover'])}]  (verify manually) ---")
+            for t in sorted(r["takeover"], key=lambda x: (x["confidence"] != "confirmed", x["host"])):
+                A(f"  [{t['confidence']}]  {t['host']}  ->  {t['cname']}  ({t['service']})")
+            A("")
+
         if r["ports"]:
             A("--- OPEN PORTS (nmap) ---")
             for ip in sorted(r["ports"]):
@@ -953,9 +1219,13 @@ def write_companions(results, output_path):
     vhosts = sorted({f"{host}  {scheme}://{ip}  [{status}]"
                      for r in results for ip, hits in r["vhosts"].items()
                      for host, scheme, status, _ in hits})
+    takeover = sorted({f"[{t['confidence']}]  {t['host']} -> {t['cname']}  ({t['service']})"
+                       for r in results for t in r.get("takeover", [])})
     written = []
-    for suffix, lines in (("_live.txt", live), ("_dead.txt", dead), ("_vhosts.txt", vhosts)):
-        if suffix == "_vhosts.txt" and not lines:
+    optional = {"_vhosts.txt", "_takeover.txt"}
+    for suffix, lines in (("_live.txt", live), ("_dead.txt", dead),
+                          ("_vhosts.txt", vhosts), ("_takeover.txt", takeover)):
+        if suffix in optional and not lines:
             continue
         p = base + suffix
         try:
@@ -974,9 +1244,12 @@ def print_summary(results):
         found = len(_found_set(r))
         ports = sum(1 for ip in r["ports"] if r["ports"][ip])
         vh = sum(len(v) for v in r["vhosts"].values())
+        to = len(r.get("takeover", []))
+        nl = len((r.get("diff") or {}).get("new_live", []))
+        extra = f", {nl} NEW" if nl else ""
         good(f"{r['target']}: {found} found "
              f"({len(r['resolved'])} live / {len(r['unresolved'])} dead), "
-             f"{len(r['http'])} web, {vh} vhosts, {ports} host(s) with open ports")
+             f"{len(r['http'])} web, {vh} vhosts, {to} takeover, {ports} ports{extra}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1030,6 +1303,16 @@ def parse_args():
     p.add_argument("--expand-roots", action="store_true",
                    help="also run the full pipeline on root domains found via WHOIS")
     p.add_argument("--whoxy-key", help="whoxy.com API key for reverse WHOIS")
+    p.add_argument("--no-takeover", action="store_true",
+                   help="disable subdomain takeover detection (on by default)")
+    p.add_argument("--monitor", action="store_true",
+                   help="diff against the previous run, save a baseline, highlight new assets")
+    p.add_argument("--state-dir", default="~/.recon/state",
+                   help="where monitoring baselines are stored (default: ~/.recon/state)")
+    p.add_argument("--notify-webhook", dest="notify_webhook",
+                   help="Slack/Discord webhook URL for new-asset alerts (use with --monitor)")
+    p.add_argument("--json", action="store_true",
+                   help="also write structured results to <output>.json")
     p.add_argument("--no-color", action="store_true", help="disable colored output")
     p.add_argument("-v", "--verbose", action="store_true", help="show child-process stderr")
     return p.parse_args()
@@ -1096,8 +1379,22 @@ def main():
                 pass
 
     if results:
+        if args.monitor:
+            for r in results:
+                prev = load_state(args.state_dir, r["target"])
+                r["diff"] = diff_results(prev, r)
+                save_state(args.state_dir, r["target"], r)
+            if args.notify_webhook:
+                msg = build_diff_message(results)
+                if msg:
+                    notify_webhook(args.notify_webhook, msg)
+
         write_report(results, args.output, time.time() - start)
         good(f"report written to {args.output}")
+        if args.json:
+            jp = write_json(results, args.output)
+            if jp:
+                good(f"wrote {jp}")
         for p, n in write_companions(results, args.output):
             good(f"wrote {p} ({n} entries)")
         print_summary(results)
