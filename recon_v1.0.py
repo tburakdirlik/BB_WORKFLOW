@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-recon.py - subdomain enumeration & attack-surface mapping pipeline - recon_v1.2.py
+recon.py - subdomain enumeration & attack-surface mapping pipeline  -  recon_v1.3.py
 
 Goal: enumerate *all* live subdomains of a target as completely and
 accurately as possible, and separately surface the dead (non-resolving)
@@ -8,8 +8,9 @@ names so they can be reused for virtual-host enumeration.
 
 Pipeline per target:
     root domain discovery (whois / whoxy)
-      -> passive enumeration   (subfinder, crt.sh, gau/waybackurls,
-                                 assetfinder, github-subdomains, amass)
+      -> passive enumeration   (subfinder, crt.sh, Chaos, VirusTotal,
+                                 gau/waybackurls, assetfinder,
+                                 github-subdomains, amass)
       -> DNS resolution        (puredns: bulk resolve + trusted re-validation,
                                  native threaded fallback)
       -> active discovery      (puredns bruteforce, alterx permutations,
@@ -293,30 +294,140 @@ def crtsh(domain, timeout=60, retries=3):
     return found
 
 
-def passive_enum(domain, amass=False, github_token=None):
-    """Query every available passive source. Returns {host: set(source_tags)}."""
-    found = {}
+def chaos_source(domain, api_key):
+    """
+    ProjectDiscovery Chaos DNS dataset (native, no chaos binary needed).
+        GET https://dns.projectdiscovery.io/dns/<domain>/subdomains
+        Authorization: <api_key>
+    Returns (set_of_hosts, status) where status is "ok" or "error".
+    The API returns leaf prefixes ("www", "*.cfe", "1.dev"); we rebuild the
+    full name and drop wildcard entries.
+    """
+    url = f"https://dns.projectdiscovery.io/dns/{urllib.parse.quote(domain)}/subdomains"
+    try:
+        req = urllib.request.Request(url, headers={
+            "Authorization": api_key,
+            "User-Agent": "recon.py/2.1",
+            "Connection": "close",
+        })
+        with urllib.request.urlopen(req, timeout=40) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as e:
+        warn(f"chaos query failed: {e}")
+        return set(), "error"
+    found = set()
+    for prefix in data.get("subdomains", []):
+        p = str(prefix).strip().lower().strip(".").lstrip("*.")
+        if not p:
+            continue
+        full = f"{p}.{domain}"
+        if "*" not in full and in_scope(full, domain):
+            found.add(full)
+    return found, "ok"
 
-    def add(names, src):
-        new = []
-        for n in names:
+
+def virustotal_source(domain, api_key, max_pages=15, page_size=40, pause=1.0):
+    """
+    VirusTotal v3 passive-DNS subdomains (native, no key in argv - x-apikey
+    header). The free public key is rate-limited (~4 req/min, ~500/day), so we
+    cap pagination and stop cleanly on HTTP 429.
+    Returns (set_of_hosts, status) in {"ok", "partial", "error"}.
+    """
+    found = set()
+    url = (f"https://www.virustotal.com/api/v3/domains/"
+           f"{urllib.parse.quote(domain)}/subdomains?limit={page_size}")
+    status = "ok"
+    for _ in range(max_pages):
+        try:
+            req = urllib.request.Request(url, headers={
+                "x-apikey": api_key,
+                "User-Agent": "recon.py/2.1",
+                "Accept": "application/json",
+            })
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                warn("virustotal rate limit hit (429) - stopping, keeping partial results")
+                status = "partial" if found else "error"
+            else:
+                warn(f"virustotal query failed: HTTP {e.code}")
+                status = "partial" if found else "error"
+            break
+        except Exception as e:
+            warn(f"virustotal query failed: {e}")
+            status = "partial" if found else "error"
+            break
+        for item in data.get("data", []):
+            n = str(item.get("id", "")).strip().lower().strip(".")
+            if n and in_scope(n, domain):
+                found.add(n)
+        nxt = (data.get("links") or {}).get("next")
+        if not nxt:
+            break
+        url = nxt
+        time.sleep(pause)
+    return found, status
+
+
+def passive_enum(domain, amass=False, github_token=None, keys=None):
+    """
+    Query every available passive source.
+
+    Returns (found, stats):
+        found = {host: set(source_tags)}
+        stats = {source: {"status": ..., "total": n, "unique": n}}
+    where status is one of: ok, partial, no-key, no-tool, error. `total` is how
+    many in-scope names the source returned; `unique` is how many ONLY it found.
+    """
+    keys = keys or {}
+    found = {}
+    stats = {}
+
+    def add(names, src, status="ok"):
+        cleaned = set()
+        for n in (names or []):
             n = n.strip().lower().strip(".")
             if n and in_scope(n, domain):
-                if n not in found:
-                    new.append(n)
-                found.setdefault(n, set()).add(src)
+                cleaned.add(n)
+        new = [n for n in cleaned if n not in found]
+        for n in cleaned:
+            found.setdefault(n, set()).add(src)
+        stats[src] = {"status": status}
         if new:
             good(f"{src}: +{len(new)} new")
             for n in sorted(new):
                 print(f"    {n}")
+        elif status in ("ok", "partial"):
+            info(f"{src}: {len(cleaned)} found, 0 new")
+
+    def skip(src, status):
+        stats[src] = {"status": status}
 
     if have("subfinder"):
         add(run_stream(["subfinder", "-d", domain, "-silent"], quiet=True) or [], "subfinder")
     else:
         warn("subfinder not found - skipping (github.com/projectdiscovery/subfinder)")
+        skip("subfinder", "no-tool")
 
     info("querying crt.sh (certificate transparency) ...")
     add(crtsh(domain), "crtsh")
+
+    if keys.get("chaos"):
+        info("querying Chaos (projectdiscovery dataset) ...")
+        names, st = chaos_source(domain, keys["chaos"])
+        add(names, "chaos", status=st)
+    else:
+        info("chaos: no API key - skipping (set CHAOS_KEY or add to config)")
+        skip("chaos", "no-key")
+
+    if keys.get("virustotal"):
+        info("querying VirusTotal (passive DNS) ...")
+        names, st = virustotal_source(domain, keys["virustotal"])
+        add(names, "virustotal", status=st)
+    else:
+        info("virustotal: no API key - skipping (set VT_API_KEY or add to config)")
+        skip("virustotal", "no-key")
 
     if have("gau"):
         add(hosts_from_urls(run_stream(["gau", "--subs", domain], quiet=True) or [], domain),
@@ -326,9 +437,12 @@ def passive_enum(domain, amass=False, github_token=None):
                             domain), "wayback")
     else:
         info("gau/waybackurls not found - skipping URL-archive source")
+        skip("wayback", "no-tool")
 
     if have("assetfinder"):
         add(run_stream(["assetfinder", "--subs-only", domain], quiet=True) or [], "assetfinder")
+    else:
+        skip("assetfinder", "no-tool")
 
     if have("github-subdomains"):
         if github_token:
@@ -336,6 +450,9 @@ def passive_enum(domain, amass=False, github_token=None):
                 "github")
         else:
             info("github-subdomains present but no token - set --github-token or $GITHUB_TOKEN")
+            skip("github", "no-key")
+    else:
+        skip("github", "no-tool")
 
     if amass and have("amass"):
         info("amass passive (this can be slow) ...")
@@ -343,8 +460,15 @@ def passive_enum(domain, amass=False, github_token=None):
             "amass")
     elif amass:
         warn("amass not found - skipping")
+        skip("amass", "no-tool")
 
-    return found
+    # Authoritative, order-independent per-source coverage.
+    for src, st in stats.items():
+        if st["status"] in ("ok", "partial"):
+            st["total"] = sum(1 for tags in found.values() if src in tags)
+            st["unique"] = sum(1 for tags in found.values() if tags == {src})
+
+    return found, stats
 
 
 # --------------------------------------------------------------------------- #
@@ -770,6 +894,7 @@ def result_to_dict(r):
         "vhosts": {ip: [list(t) for t in hits] for ip, hits in r["vhosts"].items()},
         "takeover": r.get("takeover", []),
         "ports": r["ports"],
+        "source_stats": r.get("source_stats", {}),
         "diff": r.get("diff", {}),
     }
 
@@ -941,6 +1066,90 @@ def summarize_tools():
 
 
 # --------------------------------------------------------------------------- #
+# API keys / config
+# --------------------------------------------------------------------------- #
+# Canonical source name -> environment variables checked, in order. The same
+# names work as KEY=value lines in the config file. Env vars take precedence.
+KEY_ENV = {
+    "virustotal": ["VT_API_KEY", "VIRUSTOTAL_API_KEY", "VIRUSTOTAL_KEY"],
+    "chaos": ["CHAOS_KEY", "PDCP_API_KEY", "CHAOS_API_KEY"],
+}
+DEFAULT_KEY_CONFIG = "~/.recon/config"
+
+
+def load_keys(config_path):
+    """
+    Load API keys for native keyed sources (VirusTotal, Chaos).
+
+    Precedence: environment variable > config file. The config file is a simple
+    list of `KEY=value` lines ('#' comments allowed), e.g.
+
+        VT_API_KEY=xxxxxxxx
+        CHAOS_KEY=yyyyyyyy
+
+    Returns {canonical_source: key_or_None}. Key VALUES are never logged - only
+    which source was loaded and from where (env vs config).
+    """
+    file_vals = {}
+    path = os.path.expanduser(config_path or DEFAULT_KEY_CONFIG)
+    if os.path.isfile(path):
+        try:
+            with open(path) as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    v = v.strip().strip('"').strip("'")
+                    if v:
+                        file_vals[k.strip().upper()] = v
+        except OSError as e:
+            warn(f"could not read key config {path}: {e}")
+
+    keys = {}
+    loaded = []
+    for canon, names in KEY_ENV.items():
+        val, origin = None, None
+        for n in names:
+            if os.environ.get(n):
+                val, origin = os.environ[n], f"env:{n}"
+                break
+        if not val:
+            for n in names:
+                if file_vals.get(n):
+                    val, origin = file_vals[n], "config"
+                    break
+        keys[canon] = val
+        if val:
+            loaded.append(f"{canon} ({origin})")
+
+    if loaded:
+        info("API keys loaded: " + ", ".join(loaded))
+    else:
+        hint = ", ".join(ns[0] for ns in KEY_ENV.values())
+        info(f"no API keys found - set {hint} in env or {path} (keyed sources skipped)")
+    return keys
+
+
+def print_source_coverage(stats):
+    """Per-source contribution summary for the passive phase (console)."""
+    if not stats:
+        return
+    print(C.w(C.BOLD, "  -- passive source coverage --"))
+    label = {"no-key": "no API key", "no-tool": "not installed", "error": "error"}
+    order = sorted(stats.items(), key=lambda kv: (-kv[1].get("total", 0), kv[0]))
+    for src, st in order:
+        status = st.get("status", "ok")
+        if status in ("ok", "partial"):
+            total, uniq = st.get("total", 0), st.get("unique", 0)
+            tag = "  (partial / rate-limited)" if status == "partial" else ""
+            line = f"    {src:<14} {total:>5} found  {uniq:>4} unique{tag}"
+            print(C.w(C.GREEN if total else C.GREY, line))
+        else:
+            print(C.w(C.GREY, f"    {src:<14}   (skipped: {label.get(status, status)})"))
+
+
+# --------------------------------------------------------------------------- #
 # Pipeline
 # --------------------------------------------------------------------------- #
 def run_pipeline(domain, args, ctx, queue, visited):
@@ -950,6 +1159,7 @@ def run_pipeline(domain, args, ctx, queue, visited):
         "target": domain, "org": None, "extra_roots": set(),
         "resolved": set(), "unresolved": set(), "sources": {},
         "http": [], "vhosts": {}, "ports": {}, "takeover": [], "diff": {},
+        "source_stats": {},
     }
     sources = result["sources"]
 
@@ -988,11 +1198,14 @@ def run_pipeline(domain, args, ctx, queue, visited):
 
     # Phase 1 - passive (multi-source)
     phase(f"passive subdomain enumeration - {domain}")
-    passive_map = passive_enum(domain, amass=args.amass, github_token=ctx["github_token"])
+    passive_map, src_stats = passive_enum(domain, amass=args.amass,
+                                          github_token=ctx["github_token"], keys=ctx["keys"])
+    result["source_stats"] = src_stats
     passive_map.setdefault(domain, set()).add("apex")
     for h, srcs in passive_map.items():
         sources.setdefault(h, set()).update(srcs)
     good(f"{len(passive_map)} unique names from passive sources")
+    print_source_coverage(src_stats)
 
     # Phase 2 - resolve passive set (CT/archive-backed names: no wildcard filtering)
     phase(f"resolving {len(passive_map)} hosts - {domain}")
@@ -1149,6 +1362,20 @@ def write_report(results, path, elapsed):
             A("  related root domains    : none discovered")
         A("")
 
+        st = r.get("source_stats") or {}
+        if st:
+            A("--- PASSIVE SOURCE COVERAGE ---")
+            label = {"no-key": "no API key", "no-tool": "not installed", "error": "error"}
+            for src, s in sorted(st.items(), key=lambda kv: (-(kv[1].get("total", 0)), kv[0])):
+                status = s.get("status", "ok")
+                if status in ("ok", "partial"):
+                    tag = "  (partial / rate-limited)" if status == "partial" else ""
+                    A(f"  {src:<14} {s.get('total', 0):>5} found, "
+                      f"{s.get('unique', 0):>4} unique{tag}")
+                else:
+                    A(f"  {src:<14}   (skipped: {label.get(status, status)})")
+            A("")
+
         sources = _found_set(r)
         resolved = r["resolved"]
         live = sorted(n for n in sources if n in resolved)
@@ -1300,6 +1527,9 @@ def parse_args():
                    help="scan all 65535 ports instead of top 1000 (very slow)")
     p.add_argument("--amass", action="store_true", help="add amass passive source (slow)")
     p.add_argument("--github-token", help="GitHub token for github-subdomains (or $GITHUB_TOKEN)")
+    p.add_argument("--config", default=DEFAULT_KEY_CONFIG,
+                   help="API key file with KEY=value lines (VT_API_KEY, CHAOS_KEY); "
+                        "environment variables override it (default: ~/.recon/config)")
     p.add_argument("--expand-roots", action="store_true",
                    help="also run the full pipeline on root domains found via WHOIS")
     p.add_argument("--whoxy-key", help="whoxy.com API key for reverse WHOIS")
@@ -1354,10 +1584,13 @@ def main():
         if args.recursive:
             recursion_wordlist = find_recursion_wordlist(args.recursion_wordlist, wordlist)
 
+    keys = load_keys(args.config)
+
     ctx = {
         "bulk": bulk, "trusted": trusted,
         "wordlist": wordlist, "recursion_wordlist": recursion_wordlist,
         "github_token": args.github_token or os.environ.get("GITHUB_TOKEN"),
+        "keys": keys,
     }
 
     summarize_tools()
