@@ -1,4 +1,4 @@
-# recon.py
+# subrecon.py
 
 A single-file **subdomain enumeration & attack-surface mapping** pipeline for bug bounty and authorized penetration testing.
 
@@ -76,17 +76,17 @@ git clone --depth 1 https://github.com/danielmiessler/SecLists.git ~/SecLists
 
 ```bash
 # single target
-python3 recon.py -t example.com -o output.txt
+python3 subrecon.py -t example.com -o output.txt
 
 # list of targets
-python3 recon.py -T targets.txt -o output.txt
+python3 subrecon.py -T targets.txt -o output.txt
 
 # thorough: big wordlist, validated resolvers, recursion, vhost, JSON
-python3 recon.py -t example.com -w ~/SecLists/Discovery/DNS/subdomains-top1million-110000.txt \
+python3 subrecon.py -t example.com -w ~/SecLists/Discovery/DNS/subdomains-top1million-110000.txt \
     -r resolvers.txt --recursive --vhost --json -o out.txt
 
 # continuous monitoring with Slack/Discord alerts on new assets
-python3 recon.py -t example.com --monitor \
+python3 subrecon.py -t example.com --monitor \
     --notify-webhook https://hooks.slack.com/services/XXX -o out.txt
 ```
 
