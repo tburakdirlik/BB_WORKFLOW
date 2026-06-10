@@ -1,2 +1,0 @@
-https://www.virustotal.com/gui/my-apikey 71591e96b46ad736c49c169cab61d466df3a69b0283015ab8591c8d80892cf83
-https://cloud.projectdiscovery.io/onboarding 9b80af08-e879-4cc3-8509-6775165d5186 
