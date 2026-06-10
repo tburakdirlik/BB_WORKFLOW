@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-recon.py - subdomain enumeration & attack-surface mapping pipeline
+recon.py - subdomain enumeration & attack-surface mapping pipeline - recon_v1.2.py
 
 Goal: enumerate *all* live subdomains of a target as completely and
 accurately as possible, and separately surface the dead (non-resolving)
