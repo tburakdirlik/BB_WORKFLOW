@@ -10,13 +10,19 @@ Point it at a domain (or a list) and it produces the most complete, accurate set
 
 ## Install
 
+Get `subrecon.py` and `setup.py` into the same folder, then run the setup script **from that folder**:
+
 ```bash
-python3 setup.py
+git clone https://github.com/tburakdirlik/BB_WORKFLOW.git
+cd BB_WORKFLOW
+python3 setup.py          # interactive: installs deps + asks VirusTotal/Chaos keys
 ```
 
-`setup.py` audits the toolchain, prints the exact install command for anything missing (Go tools via `go install`, system tools via brew/apt, SecLists, plus Homebrew/Go themselves), adds `~/go/bin` to your shell PATH, and asks for your **VirusTotal + Chaos** keys (press Enter to skip either). Run `python3 setup.py --check` for a read-only audit.
+`setup.py` audits the toolchain and prints the exact install command for anything missing (Go tools via `go install`, system tools via brew/apt, SecLists, plus Homebrew/Go themselves), adds `~/go/bin` to your shell PATH, and asks for your **VirusTotal + Chaos** keys — press Enter to skip either (they're saved to `~/.recon/config`). For a read-only audit that only reports what's missing, run `python3 setup.py --check` first.
 
-`subrecon.py` itself is **stdlib-only** (Python 3.7+); every external tool is optional and just unlocks or improves a phase. With zero tools installed, the native crt.sh source + threaded resolver still produce useful output.
+`subrecon.py` is **stdlib-only** (Python 3.7+); every external tool is optional and just unlocks or improves a phase — with zero tools installed, the native crt.sh source + threaded resolver still produce useful output. After setup, run `subrecon.py` from the same folder (see Usage below).
+
+> Inside Claude-BugHunter you don't run this by hand — `integrate.sh` places `setup.py` in `engine/` and the `/recon-setup` command runs it for you (see [Claude-BugHunter integration](#claude-bughunter-integration)).
 
 ---
 
