@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
 """
-recon.py - bug bounty reconnaissance pipeline
+recon.py - subdomain enumeration & attack-surface mapping pipeline - recon_v1.1.py
 
-Turns a company domain (or a list of domains) into a map of the external
-attack surface: subdomains (passive + active), resolved hosts, live web
-services, and - optionally - open ports.
+Goal: enumerate *all* live subdomains of a target as completely and
+accurately as possible, and separately surface the dead (non-resolving)
+names so they can be reused for virtual-host enumeration.
 
 Pipeline per target:
     root domain discovery (whois / whoxy)
-        -> passive enumeration (subfinder + crt.sh)
-        -> DNS resolution (puredns, with a native fallback)
-        -> active discovery (puredns bruteforce + alterx permutations)
-        -> HTTP probing (httpx)
-        -> [optional] port scan (nmap)
+      -> passive enumeration   (subfinder, crt.sh, gau/waybackurls,
+                                 assetfinder, github-subdomains, amass)
+      -> DNS resolution        (puredns: bulk resolve + trusted re-validation,
+                                 native threaded fallback)
+      -> active discovery      (puredns bruteforce, alterx permutations,
+                                 optional recursive bruteforce)
+      -> HTTP probing          (httpx)
+      -> virtual-host enum      (ffuf, optional, uses the dead list)
+      -> port scan             (nmap, optional)
 
-It wraps the standard tooling and degrades gracefully: if a binary is
-missing the matching phase is skipped, and crt.sh + a threaded resolver
-keep it producing useful output even with none of the Go tools installed.
+Outputs:
+    <output>            full human-readable report (everything combined)
+    <output>_live.txt   resolving subdomains, one per line
+    <output>_dead.txt   non-resolving subdomains, one per line (vhost input)
+    <output>_vhosts.txt  discovered virtual hosts (if --vhost)
+
+Everything degrades gracefully: a missing binary skips its phase, and
+crt.sh + a threaded resolver keep it useful with none of the Go tools.
 
 Usage:
     python3 recon.py -t example.com -o output.txt
-    python3 recon.py -T targets.txt -o output.txt
+    python3 recon.py -T targets.txt -o output.txt --vhost --recursive
 
 Only test assets you are explicitly authorized to assess.
 """
@@ -28,8 +37,11 @@ Only test assets you are explicitly authorized to assess.
 import argparse
 import json
 import os
+import random
+import re
 import shutil
 import socket
+import string
 import subprocess
 import sys
 import tempfile
@@ -39,6 +51,9 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+
+# Set from --verbose; when True, child-process stderr is shown for debugging.
+VERBOSE = False
 
 
 # --------------------------------------------------------------------------- #
@@ -86,7 +101,7 @@ def err(msg):
 
 
 def banner():
-    print(C.w(C.BOLD + C.CYAN, "recon.py - attack surface mapping pipeline"))
+    print(C.w(C.BOLD + C.CYAN, "recon.py - subdomain enumeration pipeline"))
 
 
 # --------------------------------------------------------------------------- #
@@ -98,8 +113,8 @@ def have(tool):
 
 def run_stream(cmd, stdin_data=None, quiet=False, indent="    "):
     """
-    Run `cmd`, stream stdout live (unless quiet), and return the list of
-    stdout lines. stderr is discarded. Returns None if the binary is missing.
+    Run `cmd`, stream stdout live (unless quiet), return list of stdout lines.
+    Returns None if the binary is missing. stderr shown only with --verbose.
 
     stdin is fed from a writer thread so large inputs cannot deadlock against
     a filling stdout pipe.
@@ -109,7 +124,7 @@ def run_stream(cmd, stdin_data=None, quiet=False, indent="    "):
             cmd,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=None if VERBOSE else subprocess.DEVNULL,
             text=True,
             bufsize=1,
         )
@@ -145,6 +160,54 @@ def in_scope(name, domain):
     return name == domain or name.endswith("." + domain)
 
 
+def clean_domain(value):
+    """Normalize user input to a bare domain: strip scheme, path, port, wildcard."""
+    d = value.strip().lower()
+    d = re.sub(r"^[a-z][a-z0-9+.-]*://", "", d)   # scheme
+    d = d.split("/", 1)[0]                         # path
+    d = d.split("?", 1)[0]                         # query
+    d = d.split(":", 1)[0]                         # port
+    d = d.lstrip("*.").strip(".")
+    return d
+
+
+def hosts_from_urls(lines, domain):
+    """Extract in-scope hostnames from a list of URLs (gau / waybackurls)."""
+    out = set()
+    for u in lines:
+        u = u.strip()
+        if not u:
+            continue
+        try:
+            netloc = urllib.parse.urlsplit(u if "://" in u else "//" + u).netloc
+        except ValueError:
+            continue
+        host = netloc.split("@")[-1].split(":")[0].lower().strip(".")
+        if host and in_scope(host, domain):
+            out.add(host)
+    return out
+
+
+def detect_wildcard(domain):
+    """
+    Return the set of IPs a wildcard DNS record resolves to (empty if none).
+
+    Used only on the native resolver path - puredns does its own wildcard
+    filtering. Catches the common `*.domain` catch-all that would otherwise
+    make every permutation candidate look live.
+    """
+    ips = set()
+    socket.setdefaulttimeout(4)
+    for _ in range(3):
+        label = "".join(random.choices(string.ascii_lowercase + string.digits, k=14))
+        try:
+            for ai in socket.getaddrinfo(f"{label}.{domain}", None):
+                ips.add(ai[4][0])
+        except (socket.gaierror, socket.timeout, UnicodeError, OSError):
+            pass
+    return ips
+
+
 # --------------------------------------------------------------------------- #
 # Phase 4 - root domain discovery
 # --------------------------------------------------------------------------- #
@@ -172,7 +235,7 @@ def whoxy_reverse(org, api_key):
     try:
         with urllib.request.urlopen(url, timeout=40) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
-    except Exception as e:  # network / json / http
+    except Exception as e:
         warn(f"whoxy query failed: {e}")
         return found
     if str(data.get("status")) != "1":
@@ -203,101 +266,154 @@ def root_domains(domain, whoxy_key):
 
 
 # --------------------------------------------------------------------------- #
-# Phase 1 - passive enumeration
+# Phase 1 - passive enumeration (multi-source)
 # --------------------------------------------------------------------------- #
-def crtsh(domain, timeout=40):
-    """Native certificate-transparency lookup (no API key, always available)."""
+def crtsh(domain, timeout=60, retries=3):
+    """Certificate-transparency lookup with retry (crt.sh 502s on big domains)."""
     url = f"https://crt.sh/?q=%25.{urllib.parse.quote(domain)}&output=json"
     found = set()
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "recon.py/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-    except Exception as e:
-        warn(f"crt.sh query failed: {e}")
-        return found
-    for entry in data:
-        for name in str(entry.get("name_value", "")).splitlines():
-            name = name.strip().lower().lstrip("*.")
-            if name and in_scope(name, domain):
-                found.add(name)
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "recon.py/2.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+            for entry in data:
+                for name in str(entry.get("name_value", "")).splitlines():
+                    name = name.strip().lower().lstrip("*.")
+                    if name and in_scope(name, domain):
+                        found.add(name)
+            return found
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(2 * (attempt + 1))
+                continue
+            warn(f"crt.sh query failed after {retries} tries: {e}")
     return found
 
 
-def passive_enum(domain):
-    found = set()
+def passive_enum(domain, amass=False, github_token=None):
+    """Query every available passive source. Returns {host: set(source_tags)}."""
+    found = {}
+
+    def add(names, src):
+        new = []
+        for n in names:
+            n = n.strip().lower().strip(".")
+            if n and in_scope(n, domain):
+                if n not in found:
+                    new.append(n)
+                found.setdefault(n, set()).add(src)
+        if new:
+            good(f"{src}: +{len(new)} new")
+            for n in sorted(new):
+                print(f"    {n}")
+
     if have("subfinder"):
-        lines = run_stream(["subfinder", "-d", domain, "-silent"])
-        for l in (lines or []):
-            l = l.strip().lower()
-            if in_scope(l, domain):
-                found.add(l)
+        add(run_stream(["subfinder", "-d", domain, "-silent"], quiet=True) or [], "subfinder")
     else:
         warn("subfinder not found - skipping (github.com/projectdiscovery/subfinder)")
 
     info("querying crt.sh (certificate transparency) ...")
-    cs = crtsh(domain)
-    for n in sorted(cs - found):
-        print(f"    {n}")
-    found |= cs
+    add(crtsh(domain), "crtsh")
+
+    if have("gau"):
+        add(hosts_from_urls(run_stream(["gau", "--subs", domain], quiet=True) or [], domain),
+            "wayback")
+    elif have("waybackurls"):
+        add(hosts_from_urls(run_stream(["waybackurls"], stdin_data=domain + "\n", quiet=True) or [],
+                            domain), "wayback")
+    else:
+        info("gau/waybackurls not found - skipping URL-archive source")
+
+    if have("assetfinder"):
+        add(run_stream(["assetfinder", "--subs-only", domain], quiet=True) or [], "assetfinder")
+
+    if have("github-subdomains"):
+        if github_token:
+            add(run_stream(["github-subdomains", "-d", domain, "-t", github_token], quiet=True) or [],
+                "github")
+        else:
+            info("github-subdomains present but no token - set --github-token or $GITHUB_TOKEN")
+
+    if amass and have("amass"):
+        info("amass passive (this can be slow) ...")
+        add(run_stream(["amass", "enum", "-passive", "-d", domain, "-timeout", "8"], quiet=True) or [],
+            "amass")
+    elif amass:
+        warn("amass not found - skipping")
+
     return found
 
 
 # --------------------------------------------------------------------------- #
 # Phase 2/3 - resolution + active discovery
 # --------------------------------------------------------------------------- #
-def resolve_python(hosts, threads=50):
-    """Threaded socket fallback used when puredns is unavailable."""
+def resolve_python(hosts, threads=50, wildcard_ips=None):
+    """
+    Threaded socket fallback used when puredns is unavailable.
+
+    If wildcard_ips is given, hosts that resolve *only* to those IPs are
+    treated as wildcard catch-all noise and dropped.
+    """
     resolved = set()
+    wildcard_ips = wildcard_ips or set()
     socket.setdefaulttimeout(4)
 
     def check(h):
         try:
-            socket.getaddrinfo(h, None)
-            return h
+            ips = {ai[4][0] for ai in socket.getaddrinfo(h, None)}
+            return h, ips
         except (socket.gaierror, socket.timeout, UnicodeError, OSError):
-            return None
+            return h, None
 
     with ThreadPoolExecutor(max_workers=threads) as ex:
-        futs = {ex.submit(check, h): h for h in hosts}
+        futs = [ex.submit(check, h) for h in hosts]
         for fut in as_completed(futs):
-            r = fut.result()
-            if r:
-                print(f"    {r}")
-                resolved.add(r)
+            h, ips = fut.result()
+            if not ips:
+                continue
+            if wildcard_ips and ips <= wildcard_ips:
+                continue
+            print(f"    {h}")
+            resolved.add(h)
     return resolved
 
 
-def resolve_hosts(hosts, resolvers_file, threads=50):
+def resolve_hosts(hosts, resolvers, trusted, threads=50, wildcard_ips=None):
     hosts = sorted(set(hosts))
     if not hosts:
         return set()
     if have("puredns"):
         cmd = ["puredns", "resolve", "-q"]
-        if resolvers_file:
-            cmd += ["-r", resolvers_file]
+        if resolvers:
+            cmd += ["-r", resolvers]
+        if trusted:
+            cmd += ["--resolvers-trusted", trusted]
         lines = run_stream(cmd, stdin_data="\n".join(hosts) + "\n")
         if lines is not None:  # binary ran (empty list = nothing resolved)
             return {l.strip().lower() for l in lines if l.strip()}
-    warn("puredns unavailable - using built-in resolver (slower, no wildcard filtering)")
-    return resolve_python(hosts, threads)
+    warn("puredns unavailable - using built-in resolver (slower)")
+    return resolve_python(hosts, threads, wildcard_ips)
 
 
-def bruteforce(domain, wordlist, resolvers_file):
+def bruteforce(base, wordlist, resolvers, trusted):
+    """Brute-force <word>.<base> with puredns (bulk resolve + trusted verify)."""
     if not have("puredns"):
         warn("puredns not found - skipping DNS brute-force")
         return set()
     if not wordlist or not os.path.isfile(wordlist):
         warn("no wordlist available - skipping DNS brute-force (use -w)")
         return set()
-    cmd = ["puredns", "bruteforce", wordlist, domain, "-q"]
-    if resolvers_file:
-        cmd += ["-r", resolvers_file]
+    cmd = ["puredns", "bruteforce", wordlist, base, "-q"]
+    if resolvers:
+        cmd += ["-r", resolvers]
+    if trusted:
+        cmd += ["--resolvers-trusted", trusted]
     lines = run_stream(cmd)
     return {l.strip().lower() for l in (lines or []) if l.strip()}
 
 
-def permutations(seed_hosts, resolvers_file, threads=50):
+def permutations(seed_hosts, resolvers, trusted, threads=50, wildcard_ips=None):
     if not have("alterx"):
         warn("alterx not found - skipping DNS permutations")
         return set()
@@ -310,16 +426,16 @@ def permutations(seed_hosts, resolvers_file, threads=50):
     if not candidates:
         return set()
     info(f"{len(candidates)} permutation candidates - resolving ...")
-    return resolve_hosts(candidates, resolvers_file, threads)
+    return resolve_hosts(candidates, resolvers, trusted, threads, wildcard_ips)
 
 
 # --------------------------------------------------------------------------- #
-# Phase 5 - public exposure
+# Phase 5 - public exposure (httpx) + ports (nmap)
 # --------------------------------------------------------------------------- #
 def fmt_http(rec):
     tech = rec.get("tech") or []
     if isinstance(tech, list):
-        tech = ", ".join(tech)
+        tech = ", ".join(str(t) for t in tech)
     title = (rec.get("title") or "").replace("\n", " ").strip()
     if len(title) > 50:
         title = title[:47] + "..."
@@ -346,7 +462,8 @@ def probe_http(hosts):
            "-tech-detect", "-ip", "-cname", "-no-color"]
     try:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                                stderr=None if VERBOSE else subprocess.DEVNULL,
+                                text=True, bufsize=1)
     except FileNotFoundError:
         warn("httpx not found - skipping web probing")
         return results
@@ -435,10 +552,72 @@ def ips_from_hosts(hosts):
 
 
 # --------------------------------------------------------------------------- #
+# Virtual-host enumeration (ffuf)
+# --------------------------------------------------------------------------- #
+def parse_ffuf_json(path):
+    """Parse ffuf -of json output into [(host, status, length), ...]."""
+    out = []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return out
+    for r in data.get("results", []):
+        host = (r.get("input") or {}).get("FUZZ", "")
+        if host:
+            out.append((host, r.get("status", ""), r.get("length", "")))
+    return out
+
+
+def vhost_enum(dead_hosts, live_ips, schemes=("https", "http")):
+    """
+    Fuzz the Host header of dead (non-resolving) names against live IPs to
+    find virtual hosts that have no public DNS record. Returns
+    {ip: [(host, scheme, status, length), ...]}.
+    """
+    out = {}
+    if not dead_hosts or not live_ips:
+        return out
+    if not have("ffuf"):
+        warn("ffuf not found - skipping virtual-host enumeration (install ffuf)")
+        return out
+
+    fd, wl = tempfile.mkstemp(prefix="recon_vhost_", suffix=".txt")
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(sorted(dead_hosts)) + "\n")
+
+    tmp_files = [wl]
+    try:
+        for ip in sorted(live_ips):
+            hits = []
+            for scheme in schemes:
+                info(f"vhost fuzzing {scheme}://{ip} ({len(dead_hosts)} candidates)")
+                ofd, ojson = tempfile.mkstemp(prefix="recon_ffuf_", suffix=".json")
+                os.close(ofd)
+                tmp_files.append(ojson)
+                cmd = ["ffuf", "-w", f"{wl}:FUZZ", "-u", f"{scheme}://{ip}/",
+                       "-H", "Host: FUZZ", "-ac", "-mc", "all",
+                       "-of", "json", "-o", ojson, "-s"]
+                run_stream(cmd, quiet=True)
+                for host, status, length in parse_ffuf_json(ojson):
+                    hits.append((host, scheme, status, length))
+                    print(f"    {scheme}://{ip}  Host: {host}  [{status}] ({length} bytes)")
+            if hits:
+                out[ip] = hits
+    finally:
+        for p in tmp_files:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Setup helpers (resolvers / wordlists / tool summary)
 # --------------------------------------------------------------------------- #
-FALLBACK_RESOLVERS = ["1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4",
-                      "9.9.9.9", "149.112.112.112", "208.67.222.222", "208.67.220.220"]
+TRUSTED_RESOLVERS = ["1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4",
+                     "9.9.9.9", "149.112.112.112", "208.67.222.222"]
 
 DEFAULT_WORDLISTS = [
     "/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt",
@@ -448,34 +627,77 @@ DEFAULT_WORDLISTS = [
     os.path.expanduser("~/SecLists/Discovery/DNS/subdomains-top1million-20000.txt"),
 ]
 
+DEFAULT_RECURSION_WORDLISTS = [
+    "/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt",
+    "/usr/share/seclists/Discovery/DNS/subdomains-top1million-20000.txt",
+    os.path.expanduser("~/SecLists/Discovery/DNS/subdomains-top1million-5000.txt"),
+]
 
-def ensure_resolvers(user_path):
-    """Return (resolvers_path, temp_path_or_None). Writes a built-in list if needed."""
-    if user_path:
-        if os.path.isfile(user_path):
-            return user_path, None
-        warn(f"resolvers file not found: {user_path} - using built-in fallback")
-    fd, path = tempfile.mkstemp(prefix="recon_resolvers_", suffix=".txt")
+
+def write_temp(lines, prefix):
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".txt")
     with os.fdopen(fd, "w") as f:
-        f.write("\n".join(FALLBACK_RESOLVERS) + "\n")
-    return path, path
+        f.write("\n".join(lines) + "\n")
+    return path
 
 
-def find_wordlist(user_path):
-    if user_path:
-        if os.path.isfile(user_path):
-            return user_path
-        warn(f"wordlist not found: {user_path}")
+def setup_resolvers(bulk_path, trusted_path):
+    """
+    Return (bulk_resolvers, trusted_resolvers, temp_files_to_cleanup).
+
+    trusted = small reliable list used by puredns for re-validation (kills
+    false positives). bulk = large list for mass resolution; falls back to
+    the trusted list if the user provides none (with a warning).
+    """
+    temps = []
+    if trusted_path and os.path.isfile(trusted_path):
+        trusted = trusted_path
+    else:
+        if trusted_path:
+            warn(f"trusted resolvers file not found: {trusted_path} - using built-in")
+        trusted = write_temp(TRUSTED_RESOLVERS, "recon_trusted_")
+        temps.append(trusted)
+
+    if bulk_path and os.path.isfile(bulk_path):
+        bulk = bulk_path
+    else:
+        if bulk_path:
+            warn(f"resolvers file not found: {bulk_path} - using built-in fallback")
+        warn("no bulk resolver list (-r) given - using built-in list for mass resolution too; "
+             "for serious brute-force supply a large validated list (e.g. trickest/resolvers)")
+        bulk = trusted
+    return bulk, trusted, temps
+
+
+def _find(paths, label, user):
+    if user:
+        if os.path.isfile(user):
+            return user
+        warn(f"{label} not found: {user}")
         return None
-    for p in DEFAULT_WORDLISTS:
+    for p in paths:
         if os.path.isfile(p):
-            info(f"using detected wordlist: {p}")
+            info(f"using detected {label}: {p}")
             return p
     return None
 
 
+def find_wordlist(user):
+    return _find(DEFAULT_WORDLISTS, "wordlist", user)
+
+
+def find_recursion_wordlist(user, fallback):
+    wl = _find(DEFAULT_RECURSION_WORDLISTS, "recursion wordlist", user)
+    if wl:
+        return wl
+    if fallback:
+        warn("no smaller recursion wordlist found - reusing main wordlist (heavy)")
+    return fallback
+
+
 def summarize_tools():
-    tools = ["subfinder", "puredns", "massdns", "alterx", "httpx", "nmap", "whois"]
+    tools = ["subfinder", "puredns", "massdns", "alterx", "httpx", "nmap", "whois",
+             "gau", "waybackurls", "assetfinder", "github-subdomains", "amass", "ffuf"]
     present = [t for t in tools if have(t)]
     missing = [t for t in tools if not have(t)]
     info("tools available: " + (", ".join(present) if present else "none"))
@@ -488,13 +710,19 @@ def summarize_tools():
 # --------------------------------------------------------------------------- #
 # Pipeline
 # --------------------------------------------------------------------------- #
-def run_pipeline(domain, args, resolvers_file, wordlist, queue, visited):
-    domain = domain.strip().lower()
+def run_pipeline(domain, args, ctx, queue, visited):
+    domain = clean_domain(domain)
+    bulk, trusted = ctx["bulk"], ctx["trusted"]
     result = {
         "target": domain, "org": None, "extra_roots": set(),
-        "passive": set(), "resolved": set(), "unresolved": set(),
-        "http": [], "ports": {},
+        "resolved": set(), "unresolved": set(), "sources": {},
+        "http": [], "vhosts": {}, "ports": {},
     }
+    sources = result["sources"]
+
+    def tag(names, label):
+        for n in names:
+            sources.setdefault(n, set()).add(label)
 
     bar = "=" * 70
     print()
@@ -508,45 +736,85 @@ def run_pipeline(domain, args, resolvers_file, wordlist, queue, visited):
     result["org"], result["extra_roots"] = org, roots
     if args.expand_roots and roots:
         for r in roots:
-            r = r.strip().lower()
+            r = clean_domain(r)
             if r and r not in visited:
                 visited.add(r)
                 queue.append(r)
                 good(f"queued related root domain: {r}")
 
-    # Phase 1 - passive
-    phase(f"passive subdomain enumeration - {domain}")
-    passive = passive_enum(domain)
-    passive.add(domain)
-    result["passive"] = passive
-    good(f"{len(passive)} unique names from passive sources")
+    # Wildcard DNS only matters for the native resolver path; puredns self-filters.
+    wildcard_ips = set()
+    need_native_active = (not args.passive_only
+                          and (not args.no_permutations or args.recursive)
+                          and not have("puredns"))
+    if need_native_active:
+        wildcard_ips = detect_wildcard(domain)
+        if wildcard_ips:
+            warn(f"wildcard DNS detected for {domain} "
+                 f"({', '.join(sorted(wildcard_ips))}) - permutation hits to those IPs dropped")
 
-    # Phase 2 - resolve passive set
-    phase(f"resolving {len(passive)} hosts - {domain}")
-    resolved = resolve_hosts(passive, resolvers_file, args.threads)
+    # Phase 1 - passive (multi-source)
+    phase(f"passive subdomain enumeration - {domain}")
+    passive_map = passive_enum(domain, amass=args.amass, github_token=ctx["github_token"])
+    passive_map.setdefault(domain, set()).add("apex")
+    for h, srcs in passive_map.items():
+        sources.setdefault(h, set()).update(srcs)
+    good(f"{len(passive_map)} unique names from passive sources")
+
+    # Phase 2 - resolve passive set (CT/archive-backed names: no wildcard filtering)
+    phase(f"resolving {len(passive_map)} hosts - {domain}")
+    resolved = resolve_hosts(passive_map, bulk, trusted, args.threads)
     good(f"{len(resolved)} hosts resolved")
 
     if not args.passive_only:
-        # Phase 3a - brute-force
+        # Phase 3a - brute-force apex
         if not args.no_bruteforce:
             phase(f"active discovery - DNS brute-force - {domain}")
-            bf = bruteforce(domain, wordlist, resolvers_file)
+            bf = bruteforce(domain, ctx["wordlist"], bulk, trusted)
+            tag(bf, "brute-force")
             new = bf - resolved
             if new:
                 good(f"{len(new)} new hosts from brute-force")
             resolved |= bf
-        # Phase 3b - permutations (seeded from confirmed live hosts)
+
+        # Phase 3b - permutations, iterated until a round adds nothing
         if not args.no_permutations:
-            phase(f"active discovery - permutations (alterx) - {domain}")
-            pm = permutations(resolved, resolvers_file, args.threads)
-            new = pm - resolved
-            if new:
-                good(f"{len(new)} new hosts from permutations")
-            resolved |= pm
+            rounds = max(1, args.perm_rounds)
+            for i in range(rounds):
+                phase(f"active discovery - permutations round {i + 1}/{rounds} - {domain}")
+                pm = permutations(resolved, bulk, trusted, args.threads, wildcard_ips)
+                tag(pm, "permutation")
+                new = pm - resolved
+                resolved |= pm
+                good(f"{len(new)} new hosts this round")
+                if not new:
+                    break
+
+        # Phase 3c - recursive brute-force (opt-in, expensive)
+        if args.recursive and not args.no_bruteforce and ctx["recursion_wordlist"]:
+            phase(f"active discovery - recursive brute-force (depth {args.recursion_depth}) - {domain}")
+            current = sorted(h for h in resolved if h != domain)
+            seen = set()
+            depth = 1
+            while current and depth <= args.recursion_depth:
+                info(f"recursion depth {depth}: {len(current)} base name(s)")
+                nxt = []
+                for base in current:
+                    if base in seen:
+                        continue
+                    seen.add(base)
+                    bf = bruteforce(base, ctx["recursion_wordlist"], bulk, trusted)
+                    tag(bf, "recursive-brute")
+                    new = bf - resolved
+                    resolved |= bf
+                    nxt.extend(sorted(new))
+                current = nxt
+                depth += 1
 
     result["resolved"] = resolved
-    result["unresolved"] = passive - resolved
-    good(f"{len(resolved)} total resolved hosts for {domain}")
+    result["unresolved"] = set(sources) - resolved
+    good(f"{len(sources)} subdomains found total "
+         f"({len(resolved)} live / {len(result['unresolved'])} dead) for {domain}")
 
     # Phase 5 - HTTP probing
     if not args.passive_only and not args.no_httpx:
@@ -554,13 +822,22 @@ def run_pipeline(domain, args, resolvers_file, wordlist, queue, visited):
         result["http"] = probe_http(resolved)
         good(f"{len(result['http'])} live web services")
 
-    # Phase 5 - network exposure
-    if args.ports and not args.passive_only:
-        if result["http"]:
-            ips = ips_from_http(result["http"])
+    # Virtual-host enumeration (uses the dead list)
+    if args.vhost and not args.passive_only:
+        dead = result["unresolved"]
+        live_ips = ips_from_http(result["http"]) if result["http"] else ips_from_hosts(resolved)
+        if not dead:
+            info("no dead subdomains to use as vhost candidates")
+        elif not live_ips:
+            info("no live IPs to fuzz virtual hosts against")
         else:
-            info("resolving hosts to IPs for port scan ...")
-            ips = ips_from_hosts(resolved)
+            phase(f"virtual-host enumeration - {len(dead)} candidates x {len(live_ips)} IP(s)")
+            result["vhosts"] = vhost_enum(dead, live_ips)
+            good(f"{sum(len(v) for v in result['vhosts'].values())} virtual-host hit(s)")
+
+    # Port scan (optional)
+    if args.ports and not args.passive_only:
+        ips = ips_from_http(result["http"]) if result["http"] else ips_from_hosts(resolved)
         if ips:
             phase(f"network exposure - port scan of {len(ips)} unique IP(s)")
             result["ports"] = port_scan(ips, args.full_ports)
@@ -571,6 +848,10 @@ def run_pipeline(domain, args, resolvers_file, wordlist, queue, visited):
 # --------------------------------------------------------------------------- #
 # Reporting
 # --------------------------------------------------------------------------- #
+def _found_set(r):
+    return r.get("sources") or {n: {"passive"} for n in (r["resolved"] | r["unresolved"])}
+
+
 def write_report(results, path, elapsed):
     out = []
     A = out.append
@@ -581,10 +862,15 @@ def write_report(results, path, elapsed):
     A(f"# Targets   : {', '.join(r['target'] for r in results)}")
     A("#" * 80)
     A("")
-    total_resolved = sum(len(r["resolved"]) for r in results)
-    total_live = sum(len(r["http"]) for r in results)
-    A(f"SUMMARY: {len(results)} target(s), {total_resolved} resolved hosts, "
-      f"{total_live} live web services")
+
+    total_found = sum(len(_found_set(r)) for r in results)
+    total_live = sum(len(r["resolved"]) for r in results)
+    total_dead = sum(len(r["unresolved"]) for r in results)
+    total_web = sum(len(r["http"]) for r in results)
+    total_vh = sum(sum(len(v) for v in r["vhosts"].values()) for r in results)
+    A(f"SUMMARY: {len(results)} target(s) | {total_found} subdomains found "
+      f"({total_live} live / {total_dead} dead) | {total_web} live web services "
+      f"| {total_vh} virtual-host hits")
     A("")
 
     for r in results:
@@ -603,19 +889,26 @@ def write_report(results, path, elapsed):
             A("  related root domains    : none discovered")
         A("")
 
-        res = sorted(r["resolved"])
-        unres = sorted(r["unresolved"])
-        A(f"--- SUBDOMAINS [{len(res)} resolved / {len(r['passive'])} discovered] ---")
-        if res:
-            A("  [resolved]")
-            for d in res:
-                A(f"    {d}")
-        if unres:
-            A("")
-            A(f"  [discovered but not resolving] ({len(unres)})")
-            for d in unres:
-                A(f"    {d}")
-        if not res and not unres:
+        sources = _found_set(r)
+        resolved = r["resolved"]
+        live = sorted(n for n in sources if n in resolved)
+        dead = sorted(n for n in sources if n not in resolved)
+
+        A(f"--- LIVE SUBDOMAINS [{len(live)}] ---")
+        if live:
+            width = min(max(len(n) for n in live), 55)
+            for n in live:
+                A(f"  {n.ljust(width)}  (found via: {', '.join(sorted(sources[n]))})")
+        else:
+            A("  (none)")
+        A("")
+
+        A(f"--- DEAD / NON-RESOLVING SUBDOMAINS [{len(dead)}]  (vhost candidates) ---")
+        if dead:
+            width = min(max(len(n) for n in dead), 55)
+            for n in dead:
+                A(f"  {n.ljust(width)}  (found via: {', '.join(sorted(sources[n]))})")
+        else:
             A("  (none)")
         A("")
 
@@ -623,6 +916,15 @@ def write_report(results, path, elapsed):
             A(f"--- LIVE WEB SERVICES (httpx) [{len(r['http'])}] ---")
             for rec in sorted(r["http"], key=lambda x: str(x.get("url"))):
                 A("  " + fmt_http(rec))
+            A("")
+
+        if r["vhosts"]:
+            n = sum(len(v) for v in r["vhosts"].values())
+            A(f"--- VIRTUAL HOSTS (ffuf, Host-header) [{n}] ---")
+            for ip in sorted(r["vhosts"]):
+                A(f"  {ip}")
+                for host, scheme, status, length in r["vhosts"][ip]:
+                    A(f"    {scheme}://{ip}  Host: {host}  [{status}] ({length} bytes)")
             A("")
 
         if r["ports"]:
@@ -643,13 +945,38 @@ def write_report(results, path, elapsed):
         err(f"failed to write report: {e}")
 
 
+def write_companions(results, output_path):
+    """Write machine-friendly one-per-line lists next to the main report."""
+    base = os.path.splitext(output_path)[0]
+    live = sorted({n for r in results for n in r["resolved"]})
+    dead = sorted({n for r in results for n in r["unresolved"]})
+    vhosts = sorted({f"{host}  {scheme}://{ip}  [{status}]"
+                     for r in results for ip, hits in r["vhosts"].items()
+                     for host, scheme, status, _ in hits})
+    written = []
+    for suffix, lines in (("_live.txt", live), ("_dead.txt", dead), ("_vhosts.txt", vhosts)):
+        if suffix == "_vhosts.txt" and not lines:
+            continue
+        p = base + suffix
+        try:
+            with open(p, "w") as f:
+                f.write("\n".join(lines) + ("\n" if lines else ""))
+            written.append((p, len(lines)))
+        except OSError as e:
+            err(f"failed to write {p}: {e}")
+    return written
+
+
 def print_summary(results):
     print()
     print(C.w(C.BOLD, "-- Summary --"))
     for r in results:
+        found = len(_found_set(r))
         ports = sum(1 for ip in r["ports"] if r["ports"][ip])
-        good(f"{r['target']}: {len(r['resolved'])} resolved, "
-             f"{len(r['http'])} live web, {ports} host(s) with open ports")
+        vh = sum(len(v) for v in r["vhosts"].values())
+        good(f"{r['target']}: {found} found "
+             f"({len(r['resolved'])} live / {len(r['unresolved'])} dead), "
+             f"{len(r['http'])} web, {vh} vhosts, {ports} host(s) with open ports")
 
 
 # --------------------------------------------------------------------------- #
@@ -658,13 +985,13 @@ def print_summary(results):
 def parse_args():
     p = argparse.ArgumentParser(
         prog="recon.py",
-        description="Bug bounty reconnaissance pipeline (passive + active subdomain "
-                    "enumeration, resolution, web probing, port scanning).",
+        description="Subdomain enumeration pipeline (passive + active discovery, "
+                    "resolution with trusted re-validation, web probing, vhost enum).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
                "  python3 recon.py -t example.com -o output.txt\n"
                "  python3 recon.py -T targets.txt -o output.txt\n"
-               "  python3 recon.py -t example.com -w wordlist.txt -r resolvers.txt --ports -o out.txt\n"
+               "  python3 recon.py -t example.com -w big.txt -r resolvers.txt --recursive --vhost -o out.txt\n"
                "\nOnly test assets you are authorized to assess.",
     )
     g = p.add_mutually_exclusive_group(required=True)
@@ -672,9 +999,12 @@ def parse_args():
     g.add_argument("-T", "--targets", help="file with target domains, one per line")
 
     p.add_argument("-o", "--output", default="recon_output.txt",
-                   help="output report file (default: recon_output.txt)")
+                   help="output report file (default: recon_output.txt); "
+                        "companion _live/_dead/_vhosts lists are written alongside it")
     p.add_argument("-w", "--wordlist", help="wordlist for DNS brute-force (puredns)")
-    p.add_argument("-r", "--resolvers", help="DNS resolvers file (puredns)")
+    p.add_argument("-r", "--resolvers", help="bulk DNS resolvers file for mass resolution")
+    p.add_argument("--resolvers-trusted", dest="trusted_resolvers",
+                   help="trusted resolvers file for re-validation (default: built-in)")
     p.add_argument("--threads", type=int, default=50,
                    help="concurrency for the native resolver fallback (default: 50)")
 
@@ -682,37 +1012,47 @@ def parse_args():
                    help="passive enumeration + resolution only (no active probing of target)")
     p.add_argument("--no-bruteforce", action="store_true", help="skip DNS brute-force")
     p.add_argument("--no-permutations", action="store_true", help="skip alterx permutations")
+    p.add_argument("--perm-rounds", type=int, default=2,
+                   help="max permutation rounds, stops early on no new (default: 2)")
+    p.add_argument("--recursive", action="store_true",
+                   help="recursive brute-force into discovered subdomains (slow)")
+    p.add_argument("--recursion-depth", type=int, default=1,
+                   help="recursion levels when --recursive (default: 1)")
+    p.add_argument("--recursion-wordlist", help="smaller wordlist for recursion")
     p.add_argument("--no-httpx", action="store_true", help="skip HTTP probing")
-    p.add_argument("--ports", action="store_true",
-                   help="run nmap on live IPs (slow)")
+    p.add_argument("--vhost", action="store_true",
+                   help="virtual-host enumeration: fuzz dead names as Host headers (needs ffuf)")
+    p.add_argument("--ports", action="store_true", help="run nmap on live IPs (slow)")
     p.add_argument("--full-ports", action="store_true",
                    help="scan all 65535 ports instead of top 1000 (very slow)")
+    p.add_argument("--amass", action="store_true", help="add amass passive source (slow)")
+    p.add_argument("--github-token", help="GitHub token for github-subdomains (or $GITHUB_TOKEN)")
     p.add_argument("--expand-roots", action="store_true",
                    help="also run the full pipeline on root domains found via WHOIS")
     p.add_argument("--whoxy-key", help="whoxy.com API key for reverse WHOIS")
     p.add_argument("--no-color", action="store_true", help="disable colored output")
-    p.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
+    p.add_argument("-v", "--verbose", action="store_true", help="show child-process stderr")
     return p.parse_args()
 
 
 def load_targets(args):
+    raw = []
     if args.target:
-        return [args.target.strip().lower()]
-    targets = []
-    try:
-        with open(args.targets) as f:
-            for line in f:
-                line = line.strip().lower()
-                if line and not line.startswith("#"):
-                    targets.append(line)
-    except OSError as e:
-        err(f"cannot read targets file: {e}")
-        sys.exit(1)
-    return targets
+        raw = [args.target]
+    else:
+        try:
+            with open(args.targets) as f:
+                raw = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+        except OSError as e:
+            err(f"cannot read targets file: {e}")
+            sys.exit(1)
+    return [d for d in (clean_domain(x) for x in raw) if d]
 
 
 def main():
+    global VERBOSE
     args = parse_args()
+    VERBOSE = args.verbose
     if args.no_color or not sys.stdout.isatty():
         C.disable()
 
@@ -723,34 +1063,43 @@ def main():
         err("no targets provided")
         sys.exit(1)
 
-    resolvers_file, tmp_resolvers = ensure_resolvers(args.resolvers)
+    bulk, trusted, temps = setup_resolvers(args.resolvers, args.trusted_resolvers)
     wordlist = None
+    recursion_wordlist = None
     if not args.passive_only and not args.no_bruteforce:
         wordlist = find_wordlist(args.wordlist)
+        if args.recursive:
+            recursion_wordlist = find_recursion_wordlist(args.recursion_wordlist, wordlist)
+
+    ctx = {
+        "bulk": bulk, "trusted": trusted,
+        "wordlist": wordlist, "recursion_wordlist": recursion_wordlist,
+        "github_token": args.github_token or os.environ.get("GITHUB_TOKEN"),
+    }
 
     summarize_tools()
 
-    queue = list(dict.fromkeys(targets))  # dedupe, keep order
+    queue = list(dict.fromkeys(targets))
     visited = set(queue)
     results = []
     start = time.time()
     try:
         while queue:
-            results.append(
-                run_pipeline(queue.pop(0), args, resolvers_file, wordlist, queue, visited)
-            )
+            results.append(run_pipeline(queue.pop(0), args, ctx, queue, visited))
     except KeyboardInterrupt:
         warn("interrupted - writing partial results ...")
     finally:
-        if tmp_resolvers and os.path.isfile(tmp_resolvers):
+        for p in temps:
             try:
-                os.remove(tmp_resolvers)
+                os.remove(p)
             except OSError:
                 pass
 
     if results:
         write_report(results, args.output, time.time() - start)
         good(f"report written to {args.output}")
+        for p, n in write_companions(results, args.output):
+            good(f"wrote {p} ({n} entries)")
         print_summary(results)
     else:
         warn("no results to write")
